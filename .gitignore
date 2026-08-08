@@ -1,0 +1,40 @@
+# ── 构建产物 ──
+*.exe
+*.o
+*.obj
+*.dll
+*.so
+build/
+dist/
+
+# ── 日志与运行数据 ──
+logs/
+server_stdout.log
+server_stderr.log
+*.log
+
+# ── 临时目录 ──
+tmp/
+temp/
+*.tmp
+
+# ── Python（参考实现）──
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ── IDE / 系统 ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── 其他 ──
+*.zip
+*.tar.gz

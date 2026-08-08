@@ -1,0 +1,22 @@
+{
+  "PORT": 8000,
+  "APP_KEY": "",
+  "APP_SECRET": "",
+  "API_DOMAIN": "bot.yuanbao.tencent.com",
+  "WS_URL": "wss://bot-wss.yuanbao.tencent.com/wss/connection",
+  "DEFAULT_GROUP_CODE": "333966713",
+  "YUANBAO_ID": "bot_598b42e14e644e97b2f1f7cc7f946948",
+  "HEARTBEAT_INTERVAL": 10,
+  "LLM_API_URL": "https://api.openai.com/v1/chat/completions",
+  "LLM_API_KEY": "",
+  "LLM_MODEL": "gpt-3.5-turbo",
+  "LLM_SYSTEM_PROMPT": "你是一个友好的QQ群聊机器人助手。请用简洁、有趣、口语化的中文回复群消息。回复不要太长，控制在2-3句话以内。",
+  "LLM_MAX_TOKENS": 200,
+  "LLM_TEMPERATURE": 0.8,
+  "LLM_TIMEOUT": 15,
+  "FORWARD_MODE_ENABLED": false,
+  "FORWARD_AT_ONLY": false,
+  "FORWARD_AT_YUANBAO": true,
+  "MSG_LOG_ENABLED": true,
+  "RECALL_MONITOR_ENABLED": false
+}

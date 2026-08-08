@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<!-- 专业增强版（全功能 / 完整特效与主题）：包含全场景液态玻璃、各厂商主题（PHONE_EFFECTS）、动态背景（视频/自定义图片）、🌌 鸿蒙空间光感、🖼️ 在线图片编辑器（ImgEditor）等全部能力 -->
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>元宝 Bot 6.0</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+    <nav class="global-nav">
+        <div class="nav-left">
+            <span class="nav-title">🤖 元宝 Bot c++ 1.0.0</span>
+        </div>
+        <div class="nav-right">
+            <button class="theme-toggle" id="moreToggle" title="设置" onclick="toggleSettings()">⋯</button>
+            <button class="theme-toggle" id="themeToggle" title="切换外观" onclick="toggleTheme()">☀️</button>
+            <div class="nav-status">
+                <span id="statusText">未连接</span>
+                <span class="status-dot" id="statusDot"></span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="content" id="content">
+        <!-- 消息面板（三栏：多群聊监听 | 消息 | 成员） -->
+        <div class="tab-page active" id="tab-messages">
+            <div class="messages-layout">
+            <!-- ── 左栏：多群聊监听 ── -->
+            <aside class="msg-col msg-col-groups">
+                <div class="settings-section">
+                    <h3>🎧 元宝派</h3>
+                    <div id="groupsList" class="member-list" style="max-height:300px;overflow-y:auto">
+                        <div class="empty-state">暂无群聊数据</div>
+                    </div>
+                    <div class="action-row">
+                        <button class="btn btn-outline btn-small" onclick="loadGroups()">🔄 刷新群聊列表</button>
+                    </div>
+                </div>
+            </aside>
+            <!-- ── 中栏：消息 ── -->
+            <main class="msg-col msg-col-messages">
+            <div class="action-row">
+                <button class="btn btn-success btn-small" id="btnConnect" onclick="connect()">🔗 连接</button>
+                <button class="btn btn-danger btn-small" id="btnDisconnect" onclick="disconnect()" disabled>🔌 断开</button>
+                <button class="btn btn-outline btn-small" onclick="loadRecentMessages()">🔄 刷新</button>
+                <button class="btn btn-outline btn-small" onclick="clearMessages()">🗑️ 清空</button>
+                <label class="auto-refresh-toggle" title="每 2 秒自动刷新">
+                    <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
+                    <span class="auto-refresh-label">自动</span>
+                </label>
+            </div>
+            <!-- 永久置顶工具栏（搜索 + 群切换）—— 不随消息滚动而消失 -->
+            <div class="messages-toolbar">
+                <div class="action-row">
+                    <div class="form-group" style="flex: 1;">
+                        <input type="text" class="form-input" id="searchMessage" placeholder="🔍 搜索消息..." oninput="filterMessagesDebounced()">
+                    </div>
+                    <select class="form-input" style="width: 130px;" id="msgLimit" onchange="loadRecentMessages()">
+                        <option value="50">最近50条</option>
+                        <option value="100">最近100条</option>
+                        <option value="200">最近200条</option>
+                        <option value="500" selected>最近500条</option>
+                    </select>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;padding:0 4px">
+                    💡 前端最多缓存 <strong>500 条</strong>实时消息 · 全部消息已自动写入本地 <code>logs/</code> 目录（不限制数量）
+                </div>
+            </div>
+            <div id="messageLog" class="message-log">
+                <div class="empty-state">暂无消息<br><small>连接后消息会自动显示在这里</small></div>
+            </div>
+        <!-- 发送面板（悬浮于消息之上） -->
+        <div id="sendSection" class="send-section">
+<div class="mode-chips" id="modeChips">
+                <button class="chip active" data-mode="normal" onclick="setMode('normal')">💬 普通</button>
+                <button class="chip" data-mode="at" onclick="setMode('at')">@ 艾特</button>
+                <button class="chip" data-mode="spam" onclick="setMode('spam')">🔁 刷屏</button>
+                <button class="chip" data-mode="atspam" onclick="setMode('atspam')">@🔁 艾特刷屏</button>
+                <button class="chip" data-mode="multi-at" onclick="setMode('multi-at')">👥 批量@</button>
+                <button class="chip" data-mode="dm" onclick="setMode('dm')">✉️ 私聊</button>
+                <button class="chip" data-mode="dmspam" onclick="setMode('dmspam')">📨 私聊刷屏</button>
+                <button class="chip" data-mode="latex" onclick="setMode('latex')">∑ LaTeX 消息</button>
+                <button class="chip" data-mode="latex-spam" onclick="setMode('latex-spam')">∑🔁 LaTeX 刷屏</button>
+                <button class="chip" data-mode="media" onclick="setMode('media')">🖼️ 图片/文件</button>
+                <button class="chip" data-mode="sticker" onclick="setMode('sticker')">😀 贴纸</button>
+            </div>
+
+            <div class="form-group" id="targetRow" style="display:none">
+                <label class="form-label" id="targetLabel">目标用户</label>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <input type="text" class="form-input" id="inputTargetId" placeholder="用户ID" style="flex: 2;">
+                    <input type="text" class="form-input" id="inputTargetNick" placeholder="显示昵称（可选）" style="flex: 1;">
+                </div>
+                <small style="color: var(--text-muted); font-size: 12px; margin-top: 4px;" id="targetHint"></small>
+            </div>
+
+            <div class="form-group" id="countRow" style="display:none">
+                <div class="setting-row">
+                    <span class="setting-label">刷屏次数</span>
+                    <input type="number" class="form-input" id="inputCount" value="5" min="1" style="max-width: 120px;">
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">间隔(秒)</span>
+                    <input type="number" class="form-input" id="inputInterval" value="0.1" min="0.01" step="0.1" style="max-width: 120px;">
+                </div>
+            </div>
+
+            <!-- 艾特全体（仅在「@ 艾特」模式下显示） -->
+            <div class="settings-section" id="atAllRow" style="display:none">
+                <h3>⚠️ 艾特全体</h3>
+                <div class="form-group">
+                    <textarea class="form-input" id="atAllText" placeholder="输入消息..." rows="2"></textarea>
+                </div>
+                <button class="btn btn-danger btn-block" onclick="sendAtAll()">🚨 艾特全体成员</button>
+            </div>
+
+            <!-- LaTeX 编辑器（v6.0：从旧版移植）-->
+            <div class="form-group" id="latexControls" style="display:none">
+                <h3>∑ LaTeX 消息编辑器</h3>
+                <div class="form-group">
+                    <label class="form-label">输入文本</label>
+                    <input type="text" class="form-input" id="latexText" placeholder="输入要转换为 LaTeX 的文本" value="测试">
+                </div>
+                <div class="latex-controls">
+                    <div class="latex-control-group">
+                        <label class="latex-control-label">
+                            <span>缩放倍数</span>
+                            <span class="latex-control-value" id="scaleValue">3.0</span>
+                        </label>
+                        <input type="range" class="latex-slider" id="scaleSlider" min="0.1" max="100" step="0.1" value="3.0">
+                    </div>
+                    <div class="latex-control-group">
+                        <label class="latex-control-label">
+                            <span>旋转角度</span>
+                            <span class="latex-control-value" id="rotateValue">15°</span>
+                        </label>
+                        <input type="range" class="latex-slider" id="rotateSlider" min="-180" max="180" step="1" value="15">
+                    </div>
+                    <div class="latex-control-group">
+                        <label class="latex-control-label">
+                            <span>字体样式</span>
+                            <span class="latex-control-value" id="fontStyleValue">常规</span>
+                        </label>
+                        <select class="latex-select" id="fontStyleSelect">
+                            <option value="normal">常规</option>
+                            <option value="bold">粗体 \mathbf</option>
+                            <option value="italic">斜体 \mathit</option>
+                            <option value="bold-italic">粗斜体 \boldsymbol</option>
+                        </select>
+                    </div>
+                    <div class="latex-control-group">
+                        <label class="latex-control-label">
+                            <span>水平缩放</span>
+                            <span class="latex-control-value" id="hScaleValue">1.0</span>
+                        </label>
+                        <input type="range" class="latex-slider" id="hScaleSlider" min="0.1" max="5" step="0.1" value="1.0">
+                    </div>
+                    <div class="latex-control-group">
+                        <label class="latex-control-label">
+                            <span>垂直缩放</span>
+                            <span class="latex-control-value" id="vScaleValue">1.0</span>
+                        </label>
+                        <input type="range" class="latex-slider" id="vScaleSlider" min="0.1" max="5" step="0.1" value="1.0">
+                    </div>
+                    <div class="latex-control-group">
+                        <div class="latex-checkbox-group">
+                            <input type="checkbox" class="latex-checkbox" id="borderCheckbox">
+                            <label for="borderCheckbox">添加边框 \fbox</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="latex-preview-container">
+                    <div class="latex-preview-title">实时预览</div>
+                    <div class="latex-preview-box" id="latexPreview">$\scalebox{3.0}{\rotatebox{15}{测试}}$</div>
+                </div>
+                <div class="latex-code-container">
+                    <div class="latex-preview-title">生成的 LaTeX 代码</div>
+                    <textarea class="latex-code-box" id="latexCode" readonly rows="2">$\scalebox{3.0}{\rotatebox{15}{测试}}$</textarea>
+                </div>
+                <div class="latex-action-buttons">
+                    <button class="btn btn-success btn-small" onclick="addToLatexList()">添加到消息列表</button>
+                    <button class="btn btn-outline btn-small" onclick="clearLatexSettings()">重置设置</button>
+                </div>
+                <div class="latex-list-container" id="latexListContainer" style="display:none">
+                    <div class="latex-preview-title">消息列表（可调整顺序）</div>
+                    <div id="latexList"></div>
+                </div>
+            </div>
+
+            <!-- 图片/文件功能区（media 模式显示） -->
+            <div id="mediaControls" style="display:none">
+            <div class="settings-section">
+                <h3>🖼️ 发送图片</h3>
+                <div class="form-group">
+                    <label class="form-label">选择图片文件</label>
+                    <div class="file-input-wrapper">
+                        <input type="file" id="imageFile" accept=".jpg,.jpeg,.png,.gif,.bmp,.webp" style="display:none" onchange="handleImageFileSelect(event)">
+                        <label for="imageFile" class="file-input-label" id="imageFileLabel">
+                            <span class="file-icon">📁</span>
+                            <span class="file-name">点击选择图片文件...</span>
+                            <button class="btn btn-outline btn-small" onclick="event.preventDefault();document.getElementById('imageFile').click()">选择文件</button>
+                        </label>
+                    </div>
+                </div>
+                <div class="file-preview" id="imagePreview">
+                    <img id="imagePreviewImg" class="file-preview-image" alt="预览">
+                    <div class="file-info">
+                        <span class="file-size" id="imageFileSize"></span>
+                        <span class="file-type" id="imageFileType"></span>
+                    </div>
+                </div>
+                <div class="image-actions">
+                    <input type="text" class="form-input" id="imageAtUser" placeholder="@ 用户ID（可选）" style="flex: 1;">
+                    <input type="text" class="form-input" id="imageAtNick" placeholder="显示昵称（可选）" style="flex: 0.8;">
+                    <button class="btn btn-primary" id="btnSendImage" onclick="sendImage()">发送图片</button>
+                </div>
+                <small style="color:var(--text-muted);display:block;margin-top:4px">支持: JPG/PNG/GIF/BMP/WebP (最大20MB)</small>
+            </div>
+
+            <div class="settings-section">
+                <h3>📦 批量发送图片 <span style="font-size:11px;background:var(--primary);color:var(--on-primary);padding:2px 8px;border-radius:999px;margin-left:6px">🆕 V4.6</span></h3>
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:10px;line-height:1.5">
+                    一次性选择多张图片，按设定间隔（默认 <b>1 秒/张</b>）依次发往目标群，直到发完所选图片。可同时附带<b>发送者自定义昵称</b>与<b>铭牌钻标</b>。
+                </p>
+                <div class="form-group">
+                    <label class="form-label">选择多张图片</label>
+                    <div class="file-input-wrapper">
+                        <input type="file" id="batchImages" accept=".jpg,.jpeg,.png,.gif,.bmp,.webp" multiple style="display:none" onchange="handleBatchImageSelect(event)">
+                        <label for="batchImages" class="file-input-label" id="batchImagesLabel">
+                            <span class="file-icon">📁</span>
+                            <span class="file-name">点击选择多张图片...</span>
+                            <button class="btn btn-outline btn-small" onclick="event.preventDefault();document.getElementById('batchImages').click()">选择文件</button>
+                        </label>
+                    </div>
+                </div>
+                <div class="batch-grid" id="batchPreview"></div>
+                <div class="batch-meta" id="batchMeta" style="display:none">
+                    <span id="batchCount">已选 0 张</span>
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+                    <div style="flex:1;min-width:160px">
+                        <label class="form-label">目标群</label>
+                        <select class="form-input" id="batchGroup"></select>
+                    </div>
+                    <div style="flex:0 0 150px">
+                        <label class="form-label">发送间隔(毫秒)</label>
+                        <input type="number" class="form-input" id="batchInterval" value="1000" min="200" step="100">
+                    </div>
+                </div>
+                <div class="batch-progress" id="batchProgressWrap" style="display:none;margin-top:12px">
+                    <div class="batch-bar"><div class="batch-bar-fill" id="batchBar"></div></div>
+                    <div class="batch-status" id="batchStatus">准备中...</div>
+                </div>
+                <div class="image-actions" style="margin-top:12px">
+                    <button class="btn btn-primary" id="btnBatchSend" onclick="sendImageBatch()">🚀 开始批量发送</button>
+                    <button class="btn btn-danger" id="btnBatchCancel" onclick="cancelBatchSend()" style="display:none">⛔ 取消</button>
+                </div>
+                <small style="color:var(--text-muted);display:block;margin-top:6px">每发送一张后等待设定间隔再发下一张；发送中可随时取消。单张最大 20MB，最多 50 张。</small>
+            </div>
+
+            <div class="settings-section">
+                <h3>📁 发送文件</h3>
+                <div class="form-group">
+                    <label class="form-label">选择文件</label>
+                    <div class="file-input-wrapper">
+                        <input type="file" id="documentFile" style="display:none" onchange="handleFileSelect(event)">
+                        <label for="documentFile" class="file-input-label" id="documentFileLabel">
+                            <span class="file-icon">📁</span>
+                            <span class="file-name">点击选择文件...</span>
+                            <button class="btn btn-outline btn-small" onclick="event.preventDefault();document.getElementById('documentFile').click()">选择文件</button>
+                        </label>
+                    </div>
+                </div>
+                <div class="file-info" id="fileInfo" style="display:none">
+                    <span class="file-size" id="fileSize"></span>
+                    <span class="file-type" id="fileType"></span>
+                </div>
+                <div class="file-actions">
+                    <input type="text" class="form-input" id="fileAtUser" placeholder="@ 用户ID（可选）" style="flex: 1;">
+                    <input type="text" class="form-input" id="fileAtNick" placeholder="显示昵称（可选）" style="flex: 0.8;">
+                    <button class="btn btn-primary" id="btnSendFile" onclick="sendFile()">发送文件</button>
+                </div>
+                <small style="color:var(--text-muted);display:block;margin-top:4px">支持任意文件类型 (最大20MB)</small>
+            </div>
+
+            <div class="settings-section">
+                <h3>🎨 AI 生成图片</h3>
+                <div class="form-group">
+                    <label class="form-label">输入提示词（描述你想要生成的图片）</label>
+                    <textarea class="form-input" id="aiImagePrompt" placeholder="例如：一只可爱的橘猫在阳光下打盹，宫崎骏风格" rows="3"></textarea>
+                </div>
+                <div class="ai-image-info" id="aiImageStatus" style="display:none">
+                    <span class="ai-image-spinner"></span>
+                    <span id="aiImageStatusText">正在生成图片，请稍候...</span>
+                </div>
+                <button class="btn btn-primary btn-block" id="btnSendAiImage" onclick="sendAiImage()">
+                    ✨ 生成并发送图片
+                </button>
+                <small style="color:var(--text-muted);display:block;margin-top:4px">向元宝发送图片生成指令，等待约 10-60 秒后自动发送到当前群聊</small>
+            </div>
+            </div>
+
+            <!-- 贴纸发送区（sticker 模式显示） -->
+            <div id="stickerControls" style="display:none">
+            <input type="text" class="form-input sticker-search" id="stickerSearch" placeholder="🔍 搜索贴纸..." oninput="filterStickersDebounced()">
+            <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;padding:0 4px">💡 单击选中 · <strong>双击直接发送</strong>（使用下方刷屏次数与附加文本设置）</div>
+            <div class="sticker-grid" id="stickerGrid"></div>
+            <div class="sticker-text-row">
+                <input type="text" class="form-input" id="stickerText" placeholder="附加文本（可选）">
+                <input type="text" class="form-input" id="stickerAtUser" placeholder="@ 用户ID（可选）" style="flex: 0.7;">
+                <input type="text" class="form-input" id="stickerAtNick" placeholder="显示昵称（可选）" style="flex: 0.7;">
+            </div>
+            <div class="sticker-actions">
+                <div class="setting-row" style="flex: 1;">
+                    <span class="setting-label">刷屏次数</span>
+                    <input type="number" class="form-input" id="stickerCount" value="1" min="1" style="max-width: 80px;">
+                </div>
+                <div class="setting-row" style="flex: 1;">
+                    <span class="setting-label">间隔(秒)</span>
+                    <input type="number" class="form-input" id="stickerInterval" value="0.1" min="0.01" step="0.1" style="max-width: 80px;">
+                </div>
+                <button class="btn btn-primary" id="btnSendSticker" onclick="sendSticker()">发送贴纸</button>
+            </div>
+            </div>
+
+            <!-- 文本发送区（非 media 模式显示） -->
+            <div id="sendTextArea">
+            <div class="form-group">
+                <label class="form-label">消息内容</label>
+                <textarea class="form-input" id="inputMessage" placeholder="输入要发送的消息..." rows="3"></textarea>
+            </div>
+            <button class="btn btn-primary btn-block" id="btnSend" onclick="sendMessage()">📤 发送</button>
+            </div>
+        </div>
+            </main>
+
+            <!-- ── 右栏：成员管理 ── -->
+            <aside class="msg-col msg-col-members">
+                <div class="settings-section">
+                    <h3>👥 成员</h3>
+                    <!-- 成员子面板 -->
+                    <div class="panel-content active" id="panel-group-members">
+                        <div class="action-row">
+                            <input type="text" class="form-input" style="flex:1" id="memberSearch" placeholder="🔍 搜索成员..." oninput="filterMembersDebounced()">
+                            <button class="btn btn-primary btn-small" onclick="loadMembers()">🔄 刷新</button>
+                        </div>
+                        <div class="member-list" id="memberList"><div class="empty-state">点击刷新获取成员</div></div>
+                    </div>
+                </div>
+            </aside>
+            </div>
+        </div>
+
+        <!-- V4.2 展开式消息编辑器（消息栏底部的双线箭头按钮触发的全功能编辑器） -->
+        <div class="chat-composer-overlay" id="chatComposerOverlay" onclick="if(event.target===this)closeChatComposer()">
+            <div class="chat-composer-panel">
+                <div class="chat-composer-header">
+                    <h3>📨 展开消息编辑器</h3>
+                    <button class="chat-composer-close" onclick="closeChatComposer()">&times;</button>
+                </div>
+                <div class="mode-chips" id="composerModeChips" style="margin-bottom:14px">
+                    <button class="chip active" data-mode="normal" onclick="setComposerMode('normal')">💬 普通</button>
+                    <button class="chip" data-mode="at" onclick="setComposerMode('at')">@ 艾特</button>
+                    <button class="chip" data-mode="spam" onclick="setComposerMode('spam')">🔁 刷屏</button>
+                    <button class="chip" data-mode="atspam" onclick="setComposerMode('atspam')">@🔁 艾特刷屏</button>
+                    <button class="chip" data-mode="multi-at" onclick="setComposerMode('multi-at')">👥 批量@</button>
+                    <button class="chip" data-mode="dm" onclick="setComposerMode('dm')">✉️ 私聊</button>
+                    <button class="chip" data-mode="dmspam" onclick="setComposerMode('dmspam')">📨 私聊刷屏</button>
+                    <button class="chip" data-mode="latex" onclick="setComposerMode('latex')">∑ LaTeX</button>
+                    <button class="chip" data-mode="latex-spam" onclick="setComposerMode('latex-spam')">∑🔁 LaTeX 刷屏</button>
+                </div>
+                <div class="form-group" id="composerTargetRow" style="display:none">
+                    <label class="form-label">目标用户</label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <input type="text" class="form-input" id="composerTargetId" placeholder="用户ID" style="flex:2">
+                        <input type="text" class="form-input" id="composerTargetNick" placeholder="显示昵称（可选）" style="flex:1">
+                    </div>
+                </div>
+                <div class="form-group" id="composerCountRow" style="display:none">
+                    <div class="setting-row"><span class="setting-label">刷屏次数</span><input type="number" class="form-input" id="composerCount" value="5" min="1" style="max-width:120px"></div>
+                    <div class="setting-row"><span class="setting-label">间隔(秒)</span><input type="number" class="form-input" id="composerInterval" value="0.1" min="0.01" step="0.1" style="max-width:120px"></div>
+                </div>
+                <div class="form-group" id="composerLatexControls" style="display:none">
+                    <label class="form-label">LaTeX 文本</label>
+                    <input type="text" class="form-input" id="composerLatexText" value="测试" style="margin-bottom:8px">
+                    <div class="latex-controls" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                        <div><label class="form-label" style="font-size:11px">缩放</label><input type="range" class="latex-slider" id="composerScaleSlider" min="0.1" max="100" step="0.1" value="3.0"></div>
+                        <div><label class="form-label" style="font-size:11px">旋转</label><input type="range" class="latex-slider" id="composerRotateSlider" min="-180" max="180" step="1" value="15"></div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">消息内容</label>
+                    <textarea class="form-input" id="composerText" placeholder="输入要发送的消息..." rows="3"></textarea>
+                </div>
+                <div style="display:flex;gap:8px;justify-content:flex-end">
+                    <button class="btn btn-outline" onclick="closeChatComposer()">取消</button>
+                    <button class="btn btn-primary" onclick="sendFromComposer()" style="min-width:120px">🚀 发送</button>
+                </div>
+            </div>
+        </div>
+
+
+
+        <!-- 设置面板 -->
+        <div class="tab-page" id="tab-settings">
+            <!-- ══════════ 设置功能 ══════════ -->
+            <div style="margin-top:24px;padding-top:16px;border-top:2px dashed var(--border)">
+            <div class="settings-section" style="border:1px solid var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 18%,transparent)">
+                <h3>⚙️ 常用设置 · 心跳 · 代理</h3>
+
+                <!-- ── 默认群号 ── -->
+                <div class="config-subsection">
+                    <h4>📢 默认群号</h4>
+                    <div class="setting-row">
+                        <span class="setting-label">默认群号</span>
+                        <input type="text" class="form-input" id="settingDefaultGroup" placeholder="如 333966713" style="max-width:180px">
+                    </div>
+                    <small style="color:var(--text-muted);font-size:11px">替代 config.json 的 DEFAULT_GROUP_CODE，点击「💾 保存设置」后生效。</small>
+                </div>
+
+                <!-- ── 服务端口 ── -->
+                <div class="config-subsection">
+                    <h4>🔌 服务端口</h4>
+                    <div class="setting-row">
+                        <span class="setting-label">监听端口</span>
+                        <input type="number" class="form-input" id="settingPort" step="1" min="1" max="65535" placeholder="8000" style="max-width:100px">
+                    </div>
+                    <small style="color:var(--text-muted);font-size:11px">替代 config.json 的 PORT，保存后需<span style="color:var(--warning)">重启服务</span>生效。</small>
+                </div>
+
+                <!-- ── 心跳循环 ── -->
+                <div class="config-subsection">
+                    <h4>💓 心跳循环设置</h4>
+                    <div class="setting-row">
+                        <span class="setting-label">心跳间隔(秒)</span>
+                        <input type="number" class="form-input" id="settingHeartbeatInterval" step="0.5" min="0.5" max="60" value="1.0" style="max-width:100px">
+                    </div>
+                    <button class="btn btn-primary btn-small" onclick="setHeartbeatInterval()">设置心跳间隔</button>
+                </div>
+
+                <!-- ── 大模型回复 ── -->
+                <div class="config-subsection">
+                    <h4>🤖 大模型回复</h4>
+                    <p style="font-size:12px;color:var(--text-muted);margin-bottom:10px;line-height:1.5">
+                        配置 OpenAI 兼容 API（DeepSeek / 通义千问 / 智谱等）后，群消息由大模型自动回复。<br>
+                        状态：<span id="settingLlmEnabledStatus" style="color:var(--text-muted)">未启用</span> · 点击「💾 保存设置」生效。
+                    </p>
+                    <div class="setting-row">
+                        <span class="setting-label">API 地址</span>
+                        <input type="text" class="form-input" id="settingLlmApiUrl" placeholder="https://api.openai.com/v1" style="max-width:260px">
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">API Key</span>
+                        <input type="password" class="form-input" id="settingLlmApiKey" placeholder="留空则不修改" style="max-width:260px">
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">模型名称</span>
+                        <input type="text" class="form-input" id="settingLlmModel" placeholder="gpt-3.5-turbo / deepseek-chat" style="max-width:180px">
+                    </div>
+                    <div class="setting-row" style="flex-wrap:wrap">
+                        <span class="setting-label">系统提示词</span>
+                        <textarea class="form-input" id="settingLlmSystemPrompt" rows="2" style="max-width:340px"></textarea>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">最大输出 Token</span>
+                        <input type="number" class="form-input" id="settingLlmMaxTokens" step="1" min="1" value="200" style="max-width:100px">
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">温度</span>
+                        <input type="number" class="form-input" id="settingLlmTemperature" step="0.1" min="0" max="2" value="0.8" style="max-width:100px">
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">超时(秒)</span>
+                        <input type="number" class="form-input" id="settingLlmTimeout" step="1" min="1" value="15" style="max-width:100px">
+                    </div>
+                    <div class="action-row" style="margin-top:6px">
+                        <button class="btn btn-outline btn-small" onclick="testLlmConfig(this)">🔌 测试连接</button>
+                    </div>
+                </div>
+
+                <!-- ── 代理模式 ── -->
+                <div class="config-subsection">
+                    <h4>🔁 代理模式（双模式 v3.5）</h4>
+                    <p style="font-size:12px;color:var(--text-muted);margin-bottom:10px;line-height:1.5">
+                        📌 <strong>@元宝模式</strong>：源群消息 → 转发到中转群@元宝 → 等回复 → 回原群<br>
+                        ⚡ <strong>直转模式</strong>（关闭@元宝）：源群消息 → 直接转发到中转群，不等回复，实时完成
+                    </p>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">启用代理模式</span>
+                        <label class="toggle">
+                            <input type="checkbox" id="settingForwardMode" onchange="onForwardModeToggle(this)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">仅被艾特时触发</span>
+                        <label class="toggle">
+                            <input type="checkbox" id="settingForwardAtOnly" onchange="updateForwardAtOnly(this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">🔔 @元宝（转发时）</span>
+                        <label class="toggle">
+                            <input type="checkbox" id="settingForwardAtYuanbao" checked onchange="updateForwardAtYuanbao(this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <small style="color:var(--text-muted);font-size:11px">开启 = @元宝模式（等回复回原群） | 关闭 = 直转模式（实时转发不等回复）</small>
+
+                    <div style="background:var(--bg-card);border-radius:8px;padding:10px;margin:10px 0;font-size:13px;color:var(--text-secondary);line-height:1.6">
+                        <div>📋 工作流程（随开关自动切换）：</div>
+                        <div id="workflowDesc">
+                            <div><strong>①</strong> 源群消息 → 实时转发到中转群@元宝</div>
+                            <div><strong>②</strong> 元宝回复 → 自动转发回原群</div>
+                        </div>
+                        <div>• 支持文本/贴纸/图片/文件</div>
+                    </div>
+
+                    <div class="action-row">
+                        <button class="btn btn-success btn-small" onclick="enableForwardMode()">✅ 启用</button>
+                        <button class="btn btn-danger btn-small" onclick="disableForwardMode()">⛔ 禁用</button>
+                        <button class="btn btn-outline btn-small" onclick="getForwardModeConfig()">🔄 状态</button>
+                        <button class="btn btn-outline btn-small" onclick="clearForwardQueue()">🗑️ 清队列</button>
+                    </div>
+
+                    <div id="forwardModeStatus" style="display:none;margin-top:10px;padding:10px;background:var(--bg-card);border-radius:8px">
+                        <div id="forwardModeStatusText"></div>
+                    </div>
+                </div>
+
+            </div>
+
+            <div class="settings-section">
+                <h3>🌊 液态玻璃效果</h3>
+                <div class="setting-row setting-toggle" style="margin-top:6px">
+                    <span class="setting-label">🌊 液态玻璃效果（总开关）</span>
+                    <label class="toggle"><input type="checkbox" id="lgEnabled" onchange="onLgEnabled(this.checked)"><span class="slider"></span></label>
+                </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">🧲 物理引擎动态（感应器/鼠标）</span>
+                        <label class="toggle"><input type="checkbox" id="lgPhysics" onchange="onLgPhysics(this.checked)"><span class="slider"></span></label>
+                    </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">🔍 折射（真实位移）</span>
+                        <label class="toggle"><input type="checkbox" id="lgRefraction" onchange="onLgRefraction(this.checked)"><span class="slider"></span></label>
+                    </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">💡 动态光影（高光/边缘光）</span>
+                        <label class="toggle"><input type="checkbox" id="lgLighting" onchange="onLgLighting(this.checked)"><span class="slider"></span></label>
+                    </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">⚡ 性能兼容模式（防卡死）</span>
+                        <label class="toggle"><input type="checkbox" id="lgPerf" onchange="onLgPerf(this.checked)"><span class="slider"></span></label>
+                    </div>
+                    <div class="setting-row setting-toggle">
+                        <span class="setting-label">🚀 性能极致模式（折射光彩 + 液态玻璃真流动）</span>
+                        <label class="toggle"><input type="checkbox" id="lgExtreme" onchange="onLgExtreme(this.checked)"><span class="slider"></span></label>
+                    </div>
+                    <div class="action-row" style="margin-top:8px">
+                        <button class="btn btn-outline btn-small" onclick="requestLgSensors()">📡 启用设备感应器权限</button>
+                        <span id="lgSensorStatus" style="font-size:11px;color:var(--text-muted)"></span>
+                    </div>
+                    <div id="lgExtremeStatus" style="font-size:11px;margin-top:6px;display:none"></div>
+            </div>
+
+            <div class="settings-section">
+                <h3>📒 消息记录</h3>
+                <div class="setting-row setting-toggle" style="margin-bottom:10px">
+                    <span class="setting-label">🔴 启用本地记录</span>
+                    <label class="toggle">
+                        <input type="checkbox" id="settingMsgLogEnabled" checked onchange="onMsgLogToggle(this.checked)">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;line-height:1.6">
+                    💡 所有群聊消息自动写入 <code>logs/</code> 目录，按日期滚动，<strong>不限制数量</strong>。<br>
+                    关闭后新消息不再写入文件，但已保存的日志文件保留。<br>
+                    <span id="msgLogStatusText" style="color:var(--success);font-weight:600">● 记录中</span>
+                </p>
+                <div class="setting-row setting-toggle" style="margin-bottom:10px">
+                    <span class="setting-label">🚫 撤回监听</span>
+                    <label class="toggle">
+                        <input type="checkbox" id="recallMonitorToggle" onchange="onRecallMonitorToggle(this.checked)">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;line-height:1.6">
+                    💡 开启后将监听群内消息撤回事件，自动发送撤回通知。<br>
+                    <span id="recallMonitorStatusText" style="color:var(--warning);font-weight:600">○ 未启用</span>
+                </p>
+            </div>
+
+            <div class="settings-section">
+                <h3>💓 系统状态</h3>
+                <div class="setting-row"><span>连接状态</span><span id="connectionStatusText" style="color:var(--danger);font-size:12px">未连接</span></div>
+                <div class="setting-row"><span>代理模式</span><span id="forwardModeStatusTextSmall" style="color:var(--warning);font-size:12px">未启用</span></div>
+                <div class="setting-row"><span>@元宝</span><span id="atYuanbaoStatusText" style="color:var(--warning);font-size:12px">未启用</span></div>
+                <div class="setting-row"><span>消息记录</span><span id="loggerWrittenStatus" style="color:var(--success);font-size:12px">0</span></div>
+                <div class="action-row" style="margin-top:10px">
+                    <button class="btn btn-outline btn-small" onclick="checkHeartbeat()">检测心跳</button>
+                    <button class="btn btn-outline btn-small" onclick="getForwardModeConfig()">桥接状态</button>
+                </div>
+            </div>
+
+            <!-- 插件生态（v4.4，已合并到设置页） -->
+            <div class="settings-section">
+                <div class="section-title">🧩 插件生态</div>
+                <div class="setting-row">
+                    <div style="flex:1">
+                        <div class="setting-label">从 Git 仓库安装插件</div>
+                        <div class="setting-hint">填入插件仓库地址（git clone 到 plugins/ 目录并自动加载），例如 <code style="color:var(--primary)">https://github.com/xxx/awesome-plugin.git</code></div>
+                    </div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <input type="text" id="pluginInstallUrl" class="form-input" style="min-width:260px" placeholder="https://github.com/xxx/my-yuanbao-plugin.git">
+                        <button class="btn btn-success" onclick="installPlugin()">⬇️ 安装</button>
+                    </div>
+                </div>
+            </div>
+            <div class="settings-section">
+                <div class="section-title">已安装插件 <span id="pluginCount" style="color:var(--text-dim);font-size:13px"></span></div>
+                <div id="pluginListBox"></div>
+                <div class="setting-hint" style="margin-top:10px;line-height:1.8">
+                    📌 插件约定：将插件仓库克隆到 <code style="color:var(--primary)">plugins/&lt;名称&gt;/</code>，内含 <code style="color:var(--primary)">plugin.py</code>（必须暴露 <code style="color:var(--primary)">register(ctx)</code>）与 <code style="color:var(--primary)">plugin.json</code>（元数据）。重启或点"重新加载"即可生效。<br>
+                    📌 插件可用 API：<code style="color:var(--primary)">ctx.send_group() / send_at_all() / send_sticker() / send_image() / send_file() / send_c2c()</code>、<code style="color:var(--primary)">ctx.on_message() / on_connect() / on_disconnect()</code>、<code style="color:var(--primary)">ctx.register_blueprint()</code>、<code style="color:var(--primary)">ctx.register_page(title, icon, weight)</code>、<code style="color:var(--primary)">ctx.register_card(page, title, ...)</code>、<code style="color:var(--primary)">ctx.get_config() / save_config()</code>。详见 README 插件生态章节。
+                </div>
+            </div>
+
+            <button class="btn btn-primary btn-block" onclick="saveSettings()">💾 保存设置</button>
+            </div>
+        </div>
+
+        <!-- 贴纸面板 -->
+
+
+
+    </div>
+
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     JavaScript — 修复版 v3.5
+     修复清单:
+     1. r.status → r.ok（后端统一返回 ok 字段）
+     2. API 路径全部对齐后端路由
+     3. members 字段名对齐
+     4. users 数据结构对齐（数组 → 对象映射）
+     5. settings 字段名对齐
+     6. state.botId 正确赋值
+     7. 去重状态轮询
+     8. LaTeX 模式移除（后端不支持）
+     ═══════════════════════════════════════════ -->
+
+<!-- ── 回复模态框 ── -->
+<div class="modal-overlay" id="replyModal" onclick="if(event.target===this)closeReplyModal()">
+    <div class="modal-box">
+        <div class="modal-header">
+            <span class="modal-title">💬 引用回复</span>
+            <button class="modal-close" onclick="closeReplyModal()">&times;</button>
+        </div>
+        <div class="modal-original-msg" id="modalOriginalMsg">
+            <div class="orig-label">回复消息 #<span id="modalMsgIndex"></span></div>
+            <div><span class="orig-sender" id="modalMsgSender"></span>：<span id="modalMsgContent"></span></div>
+        </div>
+        <div class="modal-form">
+            <div class="form-group">
+                <label class="form-label">回复内容</label>
+                <textarea class="form-input" id="modalReplyText" placeholder="输入回复内容..." rows="3"></textarea>
+            </div>
+            <div class="form-row">
+                <div class="form-group" style="flex:1">
+                    <label class="form-label">@ 用户ID（可选）</label>
+                    <input type="text" class="form-input" id="modalAtUser" placeholder="输入要 @ 的用户ID">
+                </div>
+                <div class="form-group" style="flex:1">
+                    <label class="form-label">显示昵称（可选）</label>
+                    <input type="text" class="form-input" id="modalAtNick" placeholder="@ 时显示的名称">
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">刷屏次数</label>
+                <input type="number" class="form-input" id="modalReplyCount" value="1" min="1" style="max-width: 100px;">
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-outline" onclick="closeReplyModal()">取消</button>
+            <button class="btn btn-primary" onclick="sendModalReply()">发送回复</button>
+        </div>
+    </div>
+</div>
+
+<!-- 铭牌编辑器（V4.2：含认证蓝标 + 自定义头像） -->
+<div class="modal-overlay" id="badgeModal" onclick="if(event.target===this)closeBadgeModal()">
+    <div class="modal-box">
+        <div class="modal-header">
+            <span class="modal-title">🪪 设置成员资料</span>
+            <button class="modal-close" onclick="closeBadgeModal()">&times;</button>
+        </div>
+        <div class="modal-original-msg">
+            <div class="orig-label">目标成员</div>
+            <div><span class="orig-sender" id="badgeTargetNick"></span> <small style="color:var(--text-muted);font-family:monospace" id="badgeTargetId"></small></div>
+        </div>
+        <div class="modal-form">
+            <!-- 自定义昵称 -->
+            <div class="form-group">
+                <label class="form-label">✏️ 自定义昵称（覆盖显示名，可选）</label>
+                <input type="text" class="form-input" id="badgeNick" placeholder="例如：技术总监 / 客服小助手" maxlength="20" oninput="updateBadgePreview()">
+                <small style="color:var(--text-muted);font-size:11px">设置后，该成员在成员列表以此昵称显示</small>
+            </div>
+
+            <!-- 头像上传 -->
+            <div class="form-group">
+                <label class="form-label">👤 自定义头像（可选）</label>
+                <div style="display:flex;align-items:center;gap:12px">
+                    <div id="badgeAvatarPreview" style="width:56px;height:56px;border-radius:50%;background:var(--input-bg);border:2px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;overflow:hidden;flex-shrink:0"></div>
+                    <div style="flex:1;display:flex;flex-direction:column;gap:6px">
+                        <input type="file" id="badgeAvatarInput" accept="image/*" style="display:none" onchange="onBadgeAvatarSelect(event)">
+                        <button class="btn btn-outline btn-small" onclick="document.getElementById('badgeAvatarInput').click()">📷 选择图片</button>
+                        <button class="btn btn-danger btn-small" onclick="removeBadgeAvatar()">🗑️ 移除头像</button>
+                    </div>
+                </div>
+                <small style="color:var(--text-muted);font-size:11px">支持 jpg/png/gif/webp，将替代默认首字母头像</small>
+            </div>
+
+            <!-- 认证蓝标 -->
+            <div class="form-group" style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--input-bg);border-radius:8px;border:1px solid var(--border-soft)">
+                <label class="toggle" style="flex-shrink:0">
+                    <input type="checkbox" id="badgeAuthToggle" onchange="updateBadgePreview()">
+                    <span class="slider"></span>
+                </label>
+                <div style="flex:1">
+                    <div style="font-size:14px;color:var(--text-primary);font-weight:600">✅ 认证蓝标（V 标）</div>
+                    <div style="font-size:11px;color:var(--text-muted)">开启后，昵称后会显示蓝色认证徽章</div>
+                </div>
+            </div>
+
+            <!-- 铭牌选择 -->
+            <div class="form-group">
+                <label class="form-label">选择预设铭牌</label>
+                <div class="badge-editor-grid" id="badgePresetGrid">
+                    <div class="badge-preset" data-type="owner" onclick="selectBadgePreset('owner','群主')">
+                        <span class="preset-sample">群主</span>
+                        <span class="preset-label">金·群主</span>
+                    </div>
+                    <div class="badge-preset" data-type="admin" onclick="selectBadgePreset('admin','管理员')">
+                        <span class="preset-sample">管理员</span>
+                        <span class="preset-label">红·管理员</span>
+                    </div>
+                    <div class="badge-preset" data-type="mod" onclick="selectBadgePreset('mod','版主')">
+                        <span class="preset-sample">版主</span>
+                        <span class="preset-label">橙·版主</span>
+                    </div>
+                    <div class="badge-preset" data-type="bot" onclick="selectBadgePreset('bot','机器人')">
+                        <span class="preset-sample">机器人</span>
+                        <span class="preset-label">青·机器人</span>
+                    </div>
+                    <div class="badge-preset" data-type="ai" onclick="selectBadgePreset('ai','元宝AI')">
+                        <span class="preset-sample">元宝AI</span>
+                        <span class="preset-label">紫·元宝</span>
+                    </div>
+                    <div class="badge-preset" data-type="vip" onclick="selectBadgePreset('vip','VIP')">
+                        <span class="preset-sample">VIP</span>
+                        <span class="preset-label">金·QQ会员</span>
+                    </div>
+                    <div class="badge-preset" data-type="svip" onclick="selectBadgePreset('svip','SVIP')">
+                        <span class="preset-sample">SVIP</span>
+                        <span class="preset-label">红·超级会员</span>
+                    </div>
+                    <div class="badge-preset" data-type="svip_year" onclick="selectBadgePreset('svip_year','年SVIP')">
+                        <span class="preset-sample">年SVIP</span>
+                        <span class="preset-label">金·年费SVIP</span>
+                    </div>
+                    <div class="badge-preset" data-type="big_vip" onclick="selectBadgePreset('big_vip','大会员')">
+                        <span class="preset-sample">大会员</span>
+                        <span class="preset-label">紫·大会员</span>
+                    </div>
+                    <div class="badge-preset" data-type="partner" onclick="selectBadgePreset('partner','合作方')">
+                        <span class="preset-sample">合作方</span>
+                        <span class="preset-label">绿·合作方</span>
+                    </div>
+                    <div class="badge-preset" data-type="member" onclick="selectBadgePreset('member','成员')">
+                        <span class="preset-sample">成员</span>
+                        <span class="preset-label">灰·成员</span>
+                    </div>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">💎 QQ 全系列钻标（V4.2 全新）</label>
+                <div class="badge-editor-grid" style="grid-template-columns:repeat(5,1fr);gap:6px">
+                    <div class="badge-preset" data-type="yellow_dia" onclick="selectBadgePreset('yellow_dia','黄钻')"><span class="preset-sample">黄钻</span><span class="preset-label">空间</span></div>
+                    <div class="badge-preset" data-type="green_dia" onclick="selectBadgePreset('green_dia','绿钻')"><span class="preset-sample">绿钻</span><span class="preset-label">QQ音乐</span></div>
+                    <div class="badge-preset" data-type="blue_dia" onclick="selectBadgePreset('blue_dia','蓝钻')"><span class="preset-sample">蓝钻</span><span class="preset-label">QQ游戏</span></div>
+                    <div class="badge-preset" data-type="purple_dia" onclick="selectBadgePreset('purple_dia','紫钻')"><span class="preset-sample">紫钻</span><span class="preset-label">炫舞</span></div>
+                    <div class="badge-preset" data-type="pink_dia" onclick="selectBadgePreset('pink_dia','粉钻')"><span class="preset-sample">粉钻</span><span class="preset-label">宠物</span></div>
+                    <div class="badge-preset" data-type="black_dia" onclick="selectBadgePreset('black_dia','黑钻')"><span class="preset-sample">黑钻</span><span class="preset-label">CF</span></div>
+                    <div class="badge-preset" data-type="red_dia" onclick="selectBadgePreset('red_dia','红钻')"><span class="preset-sample">红钻</span><span class="preset-label">QQ秀</span></div>
+                    <div class="badge-preset" data-type="gold_dia" onclick="selectBadgePreset('gold_dia','金钻')"><span class="preset-sample">金钻</span><span class="preset-label">至尊</span></div>
+                </div>
+                <small style="color:var(--text-muted);font-size:11px;display:block;margin-top:6px">钻石符号 ♦ ♛ ♕ ⚔ ♥ ♬ ⚙ 全部内嵌，点击直接套用</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">自定义文字（覆盖预设）</label>
+                <input type="text" class="form-input" id="badgeCustomText" placeholder="例如：技术总监 / 客服小助手 / 唱歌最好听的人" maxlength="20" oninput="updateBadgePreview()">
+                <small style="color:var(--text-muted);font-size:11px">留空则使用预设铭牌文字</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">实时预览</label>
+                <div id="badgePreview" style="padding:12px;background:var(--input-bg);border-radius:8px;border:1px solid var(--border-soft);font-size:14px">
+                    <span id="badgePreviewName" style="font-weight:600">昵称</span>
+                </div>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" onclick="removeBadge()" style="margin-right:auto">🗑️ 删除铭牌</button>
+            <button class="btn btn-outline" onclick="closeBadgeModal()">取消</button>
+            <button class="btn btn-primary" onclick="saveBadge()">保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- 铭牌编辑器（V4.6 恢复：点击成员 → 🪪 设置 → 自定义昵称 + 铭牌钻标） -->
+
+<!-- ════ V4.3 新功能模块：视频背景 / 图片编辑器 / @ 艾特 / 后端化设置 ════ -->
+
+<!-- ── 全场景液态玻璃：真实折射 SVG 滤镜（V4.5）── -->
+<svg width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true">
+  <defs>
+    <filter id="lg-refract" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.009 0.013" numOctaves="2" seed="11" result="noise"/>
+      <feGaussianBlur in="noise" stdDeviation="0.5" result="soft"/>
+      <!-- RGB 三通道色散（厚透镜边缘色差，参考 YanAndFish/liquid-glass） -->
+      <feDisplacementMap id="lgDispMap" in="SourceGraphic" in2="soft" scale="26" xChannelSelector="R" yChannelSelector="G" result="dispR"/>
+      <feColorMatrix in="dispR" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="redChan"/>
+      <feDisplacementMap in="SourceGraphic" in2="soft" scale="22" xChannelSelector="R" yChannelSelector="G" result="dispG"/>
+      <feColorMatrix in="dispG" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="greenChan"/>
+      <feDisplacementMap in="SourceGraphic" in2="soft" scale="18" xChannelSelector="R" yChannelSelector="G" result="dispB"/>
+      <feColorMatrix in="dispB" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="blueChan"/>
+      <feBlend in="greenChan" in2="blueChan" mode="screen" result="gbChan"/>
+      <feBlend in="redChan" in2="gbChan" mode="screen" result="rgbChan"/>
+      <!-- 对齐 alpha，避免边缘黑边/撕裂 -->
+      <feComposite in="rgbChan" in2="SourceGraphic" operator="atop" result="fixedAlpha"/>
+      <feGaussianBlur in="fixedAlpha" stdDeviation="0.35"/>
+    </filter>
+    <!-- 🚀 性能极致模式：液态玻璃真流动（湍流 baseFrequency 持续动画 → 玻璃表面真实流动） -->
+    <filter id="lg-refract-flow" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.010 0.016" numOctaves="2" seed="7" result="noise">
+        <animate attributeName="baseFrequency" dur="16s"
+                 values="0.010 0.016;0.016 0.010;0.009 0.018;0.012 0.013;0.010 0.016"
+                 repeatCount="indefinite"/>
+      </feTurbulence>
+      <feGaussianBlur in="noise" stdDeviation="0.4" result="soft"/>
+      <!-- RGB 三通道色散（流动模式，参考 YanAndFish/liquid-glass） -->
+      <feDisplacementMap in="SourceGraphic" in2="soft" scale="44" xChannelSelector="R" yChannelSelector="G" result="dispR"/>
+      <feColorMatrix in="dispR" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="redChan"/>
+      <feDisplacementMap in="SourceGraphic" in2="soft" scale="37" xChannelSelector="R" yChannelSelector="G" result="dispG"/>
+      <feColorMatrix in="dispG" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="greenChan"/>
+      <feDisplacementMap in="SourceGraphic" in2="soft" scale="30" xChannelSelector="R" yChannelSelector="G" result="dispB"/>
+      <feColorMatrix in="dispB" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="blueChan"/>
+      <feBlend in="greenChan" in2="blueChan" mode="screen" result="gbChan"/>
+      <feBlend in="redChan" in2="gbChan" mode="screen" result="rgbChan"/>
+      <feComposite in="rgbChan" in2="SourceGraphic" operator="atop" result="fixedAlpha"/>
+      <feGaussianBlur in="fixedAlpha" stdDeviation="0.3"/>
+    </filter>
+  </defs>
+</svg>
+
+    <script src="app.js"></script>
+</body>
+</html>
