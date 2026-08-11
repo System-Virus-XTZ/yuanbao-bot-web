@@ -10,7 +10,6 @@
  *   g++ -std=c++17 -O3 -Wall -I. yuanbao_unified.cpp -o yuanbao_server -lpthread -lm -lssl -lcrypto
  */
 #include "server.h"
-#include "glass.h"
 #include <regex>
 #include <cstdlib>
 #include <fstream>
@@ -112,6 +111,61 @@ bool json_parse(const std::string& s, JsonVal& out) {
                     case 't': r += '\t'; break;
                     case '"': r += '"'; break;
                     case '\\': r += '\\'; break;
+                    case '/': r += '/'; break;
+                    case 'u': {
+                        // ← 修复：支持 \uXXXX Unicode 转义。浏览器 JSON.stringify 会把
+                        //   中文等非 ASCII 字符转义为 \uXXXX 形式（如 "害羞" → "\u5bb3\u7f9e"），
+                        //   原实现未处理导致中文内容/贴纸名称解析成乱码而匹配失败。
+                        //   这里按 UTF-16 代理对处理，完整支持基本平面 + 增补平面（emoji）。
+                        if (pos + 4 < s.size()) {
+                            auto hexval = [](char c) -> int {
+                                if (c >= '0' && c <= '9') return c - '0';
+                                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                                return -1;
+                            };
+                            int h1 = hexval(s[pos + 1]), h2 = hexval(s[pos + 2]);
+                            int h3 = hexval(s[pos + 3]), h4 = hexval(s[pos + 4]);
+                            if (h1 >= 0 && h2 >= 0 && h3 >= 0 && h4 >= 0) {
+                                uint32_t cp = (uint32_t)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
+                                pos += 4;
+                                // 处理代理对（emoji 等增补平面字符）
+                                if (cp >= 0xD800 && cp <= 0xDBFF && pos + 6 < s.size()
+                                    && s[pos + 1] == '\\' && s[pos + 2] == 'u') {
+                                    int l1 = hexval(s[pos + 3]), l2 = hexval(s[pos + 4]);
+                                    int l3 = hexval(s[pos + 5]), l4 = hexval(s[pos + 6]);
+                                    if (l1 >= 0 && l2 >= 0 && l3 >= 0 && l4 >= 0) {
+                                        uint32_t lo = (uint32_t)((l1 << 12) | (l2 << 8) | (l3 << 4) | l4);
+                                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                            pos += 6;
+                                        }
+                                    }
+                                }
+                                // UTF-8 编码
+                                if (cp < 0x80) {
+                                    r += (char)cp;
+                                } else if (cp < 0x800) {
+                                    r += (char)(0xC0 | (cp >> 6));
+                                    r += (char)(0x80 | (cp & 0x3F));
+                                } else if (cp < 0x10000) {
+                                    r += (char)(0xE0 | (cp >> 12));
+                                    r += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                    r += (char)(0x80 | (cp & 0x3F));
+                                } else {
+                                    r += (char)(0xF0 | (cp >> 18));
+                                    r += (char)(0x80 | ((cp >> 12) & 0x3F));
+                                    r += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                    r += (char)(0x80 | (cp & 0x3F));
+                                }
+                            } else {
+                                r += 'u';
+                            }
+                        } else {
+                            r += 'u';
+                        }
+                        break;
+                    }
                     default: r += s[pos]; break;
                 }
             } else {
@@ -226,10 +280,12 @@ bool parse_http_request(const Bytes& data, HttpRequest& req) {
             std::string pair;
             while (std::getline(ss, pair, '&')) {
                 size_t eq = pair.find('=');
-                if (eq != std::string::npos)
-                    req.query_params[pair.substr(0, eq)] = pair.substr(eq + 1);
-                else
-                    req.query_params[pair] = "";
+                std::string key = pair.substr(0, eq);
+                std::string val = (eq != std::string::npos) ? pair.substr(eq + 1) : "";
+                // ← 修复：URL 解码 query 值（用户ID 含 + / = 等特殊字符，前端 encodeURIComponent
+                //   后 %2B/%2F 必须还原，否则私聊历史按用户过滤永远匹配不上）
+                val = util::url_decode(val);
+                req.query_params[key] = val;
             }
         }
     }
@@ -254,6 +310,9 @@ Bytes build_http_response_bytes(HttpResponse resp) {
     resp.headers["Access-Control-Allow-Origin"] = "*";
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS";
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+    // ← 修复：响应后连接即关闭，显式声明 Connection: close，兼容部分旧浏览器/代理
+    if (resp.headers.find("Connection") == resp.headers.end())
+        resp.headers["Connection"] = "close";
 
     for (auto& kv : resp.headers)
         oss << kv.first << ": " << kv.second << "\r\n";
@@ -639,18 +698,6 @@ FloodStats FloodEngine::get_stats() const {
 } // namespace flood
 
 // =====================================================================
-//  玻璃着色器（委托给 GlassShaderEngine）
-// =====================================================================
-namespace glass {
-    ShaderParams parse_params(const std::string& json) { return ShaderParams::from_json(json); }
-    std::string compile_vertex_shader() { return GlassShaderEngine::compile_vertex(); }
-    std::string compile_blur_shader() { return GlassShaderEngine::compile_blur(); }
-    std::string compile_final_composite() { return GlassShaderEngine::compile_composite(); }
-    std::string compile_fragment_shader(const ShaderParams& p) { return GlassShaderEngine::compile_fragment(p); }
-    const char* preset_json(size_t p) { return GlassShaderEngine::preset_json((GlassPreset)p); }
-} // namespace glass
-
-// =====================================================================
 //  贴纸库实现
 // =====================================================================
 StickerLibrary::StickerLibrary() {
@@ -681,6 +728,53 @@ std::string StickerLibrary::find_by_name(const std::string& name) const {
         if (kv.first.find(name) != std::string::npos) return kv.second;
     }
     return "";
+}
+
+// ← 补：扫描 ico 目录，建立 贴纸名称 → ico 文件名 映射。
+//   文件名格式 "数字_名称.ico"（如 "01_六六六.ico"），去掉"数字_"前缀后与贴纸库名称匹配。
+void StickerLibrary::scan_icons(const std::string& dir) {
+    icons.clear();
+    auto strip_prefix = [](std::string base) -> std::string {
+        size_t us = base.find('_');
+        if (us != std::string::npos) {
+            std::string num = base.substr(0, us);
+            bool all_digit = !num.empty() && std::all_of(num.begin(), num.end(),
+                                                         [](char c) { return c >= '0' && c <= '9'; });
+            if (all_digit) return base.substr(us + 1);
+        }
+        return base;
+    };
+#ifdef YUANBAO_PLATFORM_WINDOWS
+    std::wstring pattern = util::utf8_to_wide(dir) + L"\\*.ico";
+    WIN32_FIND_DATAW ffd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &ffd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::string fname = util::wide_to_utf8(std::wstring(ffd.cFileName));
+        if (fname.size() < 5) continue;
+        std::string base = fname.substr(0, fname.size() - 4);  // 去掉 ".ico"
+        base = strip_prefix(base);
+        if (!base.empty() && stickers.find(base) != stickers.end()) icons[base] = fname;
+    } while (FindNextFileW(h, &ffd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent* ent;
+    while ((ent = readdir(d))) {
+        std::string n = ent->d_name;
+        if (n.size() < 5 || n.compare(n.size() - 4, 4, ".ico") != 0) continue;
+        std::string base = n.substr(0, n.size() - 4);
+        base = strip_prefix(base);
+        if (!base.empty() && stickers.find(base) != stickers.end()) icons[base] = n;
+    }
+    closedir(d);
+#endif
+}
+
+std::string StickerLibrary::icon_file(const std::string& name) const {
+    auto it = icons.find(name);
+    return it != icons.end() ? it->second : "";
 }
 
 // =====================================================================
@@ -744,10 +838,31 @@ bool BotConfig::load(const std::string& path) {
     app_secret = gs("APP_SECRET");
     api_domain = gs("API_DOMAIN");
     ws_url = gs("WS_URL");
-    default_group_code = gs("DEFAULT_GROUP_CODE");
     yuanbao_id = gs("YUANBAO_ID");
     port = gi("PORT", 5000);
     heartbeat_interval = gi("HEARTBEAT_INTERVAL", 10);
+
+    // 多群监听列表：解析 JSON 数组 ["群1","群2"]（容错：直接写逗号分隔也行）
+    listen_groups.clear();
+    {
+        size_t p = content.find("\"LISTEN_GROUPS\"");
+        if (p != std::string::npos) {
+            size_t c = content.find(":", p);
+            size_t b = (c != std::string::npos) ? content.find('[', c) : std::string::npos;
+            size_t e = (b != std::string::npos) ? content.find(']', b) : std::string::npos;
+            if (b != std::string::npos && e != std::string::npos) {
+                std::string arr = content.substr(b + 1, e - b - 1);
+                size_t i = 0;
+                while ((i = arr.find('"', i)) != std::string::npos) {
+                    size_t q = arr.find('"', i + 1);
+                    if (q == std::string::npos) break;
+                    std::string g = arr.substr(i + 1, q - i - 1);
+                    if (!g.empty()) listen_groups.push_back(g);
+                    i = q + 1;
+                }
+            }
+        }
+    }
 
     // LLM 配置
     llm.api_url = gs("LLM_API_URL");
@@ -1077,7 +1192,12 @@ bool YuanbaoServer::bot_sign_token() {
     if (root["code"].asInt() == 0) {
         client_token_ = root["data"]["token"].asString();
         std::string bot_id = root["data"]["bot_id"].asString();
-        if (!bot_id.empty()) config_.yuanbao_id = bot_id;
+        if (!bot_id.empty()) {
+            // 自动获取 YUANBAO_ID：鉴权响应中的 bot_id 回写 config（无需硬编码）
+            bool changed = (config_.yuanbao_id != bot_id);
+            config_.yuanbao_id = bot_id;
+            if (changed) save_config();
+        }
         std::cerr << "[DEBUG] token length: " << client_token_.size() << "\n";
         std::cerr << "[DEBUG] token preview: " << client_token_.substr(0, 50) << "...\n";
         std::cout << "[Bot] 鉴权成功! Bot ID: " << bot_id
@@ -1306,7 +1426,9 @@ bool YuanbaoServer::bot_ws_send_bytes(const Bytes& data) {
     if (bot_ws_fd_ < 0) { std::cerr << "[bot_ws_send_bytes] fd<0 发送失败\n"; return false; }
 #ifndef YUANBAO_NO_OPENSSL
     if (bot_ws_ssl_) {
-        // OpenSSL 允许同一 SSL 对象并发 SSL_read/SSL_write（单向并发）
+        // 与接收循环的 SSL_read 串行化（同一互斥量），避免并发读写同一 SSL 对象
+        // 损坏其内部状态（曾导致 SSL 错误 5、SSL_write 永久阻塞、HTTP 请求线程全部卡死）
+        std::lock_guard<std::mutex> _lk(bot_send_mu_);
         int sent = SSL_write(bot_ws_ssl_, data.data(), (int)data.size());
         if (sent != (int)data.size())
             std::cerr << "[bot_ws_send_bytes] SSL_write 短写/失败 sent=" << sent << " want=" << data.size() << "\n";
@@ -1330,17 +1452,59 @@ bool YuanbaoServer::send_c2c_text(const std::string& to, const std::string& text
     if (to.empty() || text.empty()) return false;
     auto frame = bot_ws_build_send_c2c_msg(text, to);
     bool ok = bot_ws_send_bytes(frame);
-    if (ok) record_sent_message("", text);
+    // ← 修复：私聊发送记录带 peer（目标用户），供前端按人过滤历史
+    if (ok) record_sent_c2c_message(to, text);
     return ok;
 }
 
 void YuanbaoServer::record_sent_message(const std::string& group, const std::string& text) {
-    if (text.empty()) return;
+    JsonVal empty_mi;
+    record_sent_message(group, text, empty_mi);
+}
+
+// ← 修复：记录自己发送的消息（含贴纸等媒体）。此前贴纸发送成功后不记录，
+//   导致自己发的贴纸在界面上不显示。
+// ← 修复：获取 Bot 在群里的真实昵称。此前硬编码"元宝"，
+//   但 Bot 在群里的昵称可能被修改（如群成员列表中的"测试"），
+//   导致消息列表显示的 Bot 昵称与群成员列表不一致。
+std::string YuanbaoServer::bot_display_name() {
+    std::lock_guard<std::mutex> l(members_mu_);
+    // 在所有群缓存中查找 Bot 自己的昵称（按群分别缓存，遍历查找）
+    for (auto& kv : members_cache_map_) {
+        for (auto& m : kv.second.members) {
+            if (m.first == config_.yuanbao_id && !m.second.empty()) return m.second;
+        }
+    }
+    return "元宝";
+}
+
+void YuanbaoServer::record_sent_message(const std::string& group, const std::string& text, const JsonVal& media_info) {
+    if (text.empty() && media_info.obj.empty()) return;
     JsonVal entry;
     entry["cmd"] = "send_group_message";
     entry["sender_id"] = config_.yuanbao_id;
-    entry["sender_name"] = "元宝";
+    entry["sender_name"] = bot_display_name();
     entry["group_code"] = group;
+    entry["content"] = text;
+    if (!media_info.obj.empty()) entry["media_info"] = media_info;
+    std::string ts = util::time_iso();
+    entry["time"] = ts;
+    entry["timestamp"] = ts;
+    entry["msg_id"] = "self-" + util::random_hex_id();
+    cache_message(entry);
+    msg_logger_.log(entry);
+}
+
+// ← 补：私聊发送记录（带 peer，供前端按人过滤历史）
+void YuanbaoServer::record_sent_c2c_message(const std::string& to, const std::string& text) {
+    if (to.empty() || text.empty()) return;
+    JsonVal entry;
+    entry["cmd"] = "send_c2c_message";
+    entry["sender_id"] = config_.yuanbao_id;
+    entry["sender_name"] = bot_display_name();
+    entry["group_code"] = "";
+    entry["is_c2c"] = true;
+    entry["c2c_peer"] = to;
     entry["content"] = text;
     std::string ts = util::time_iso();
     entry["time"] = ts;
@@ -1463,6 +1627,7 @@ bool YuanbaoServer::upload_media(const std::string& file_name, const std::string
         return false;
     }
 
+
     // COS 签名（与 Python _upload_to_cos 手动签名一致）
     std::string key_time = start_time + ";" + expired_time;
     std::string sign_key = hmac_sha1_hex(secret_key, key_time);
@@ -1513,7 +1678,26 @@ bool YuanbaoServer::upload_media(const std::string& file_name, const std::string
         return false;
     }
 
-    out_url = !resource_url.empty() ? resource_url : upload_url;
+
+    // ← 修复：保存上传凭证，供 /api/image-proxy 对 _64 域图片重新签名 GET URL 下载
+    {
+        std::lock_guard<std::mutex> l(members_mu_);
+        std::cerr << "[Bot] upload_media save sk=" << secret_key.substr(0, 4) << " keytime=" << key_time << "\n";
+        cos_upload_region_ = region;
+        cos_upload_bucket_ = bucket;
+        cos_upload_location_ = location;
+        cos_upload_secret_id_ = secret_id;
+        cos_upload_secret_key_ = secret_key;
+        cos_upload_token_ = security_token;
+        cos_upload_key_time_ = key_time;
+        cos_upload_expired_ = (int64_t)strtoll(expired_time.c_str(), nullptr, 10);
+    }
+
+    // ← 修复：对齐撤回提示的图片补发逻辑（handle_recall_notification）——
+    //   直接用 genUploadInfo 返回的 resourceUrl（不 resolve、不签名）。
+    //   撤回补发正是用 media_info.image_urls（resourceUrl）直接 send_group_image 成功，
+    //   说明服务端能通过 resourceUrl 引用图片。
+    out_url = resource_url;
     return true;
 }
 
@@ -1570,7 +1754,8 @@ bool YuanbaoServer::send_group_file(const std::string& group, const std::string&
 
 bool YuanbaoServer::send_group_at(const std::string& group, const std::string& text,
                                   const std::string& user_id, const std::string& display_name) {
-    if (group.empty() || text.empty() || user_id.empty()) return false;
+    // ← 修复：允许空文本（前端「@昵称」不带内容也可发送）
+    if (group.empty() || user_id.empty()) return false;
     // 与 Python _build_at_message 完全一致：at_elem + text_elem（两个 field 6）
     std::string body_msg_id = util::random_hex_id();
     std::string head_msg_id = util::random_hex_id();
@@ -1579,13 +1764,18 @@ bool YuanbaoServer::send_group_at(const std::string& group, const std::string& t
     Bytes head = proto::encode_conn_head(0, "send_group_message", ++bot_seq_no_, head_msg_id, "yuanbao_openclaw_proxy");
     auto frame = proto::build_ws_frame(2, proto::encode_conn_msg(head, body));
     bool ok = bot_ws_send_bytes(frame);
-    if (ok) record_sent_message(group, text);
+    // ← 修复：记录时补上 @ 前缀（对齐收到消息的 "@昵称 文本" 格式），
+    //   否则自己发送的 @ 消息在消息面板中不显示 @
+    if (ok) {
+        std::string at_display = display_name.empty() ? user_id : display_name;
+        record_sent_message(group, "@" + at_display + " " + text);
+    }
     return ok;
 }
 
 bool YuanbaoServer::send_group_multi_at(const std::string& group, const std::string& text,
                                         const std::vector<std::pair<std::string, std::string>>& at_users) {
-    if (group.empty() || text.empty() || at_users.empty()) return false;
+    if (group.empty() || at_users.empty()) return false;
     // 与 Python _build_multi_at_message 一致：多个 at_elem + text_elem
     std::string body_msg_id = util::random_hex_id();
     std::string head_msg_id = util::random_hex_id();
@@ -1594,7 +1784,37 @@ bool YuanbaoServer::send_group_multi_at(const std::string& group, const std::str
     Bytes head = proto::encode_conn_head(0, "send_group_message", ++bot_seq_no_, head_msg_id, "yuanbao_openclaw_proxy");
     auto frame = proto::build_ws_frame(2, proto::encode_conn_msg(head, body));
     bool ok = bot_ws_send_bytes(frame);
-    if (ok) record_sent_message(group, text);
+    // ← 修复：记录时补上所有 @ 前缀，与收到的批量 @ 消息显示格式一致
+    if (ok) {
+        std::string ats;
+        for (auto& u : at_users) {
+            ats += "@" + (u.second.empty() ? u.first : u.second) + " ";
+        }
+        record_sent_message(group, ats + text);
+    }
+    return ok;
+}
+
+bool YuanbaoServer::send_group_parts(const std::string& group, const std::vector<proto::SendPart>& parts) {
+    if (group.empty() || parts.empty()) return false;
+    std::string body_msg_id = util::random_hex_id();
+    std::string head_msg_id = util::random_hex_id();
+    Bytes body = proto::encode_send_group_parts_msg(
+        body_msg_id, group, config_.yuanbao_id, parts);
+    Bytes head = proto::encode_conn_head(0, "send_group_message", ++bot_seq_no_, head_msg_id, "yuanbao_openclaw_proxy");
+    auto frame = proto::build_ws_frame(2, proto::encode_conn_msg(head, body));
+    bool ok = bot_ws_send_bytes(frame);
+    // 记录日志：按片段顺序还原 "@昵称" 与文本，保持原始位置
+    if (ok) {
+        std::string log;
+        for (auto& p : parts) {
+            if (p.type == 1)
+                log += "@" + (p.display.empty() ? p.user_id : p.display);
+            else
+                log += p.text;
+        }
+        record_sent_message(group, log);
+    }
     return ok;
 }
 
@@ -1689,11 +1909,15 @@ void YuanbaoServer::bot_ws_recv_loop() {
             break;
         }
 
+        // ← 修复死循环：parse_ws_frame 内部会重置 pos（它把 pos 当纯输出），
+        //   旧代码直接复用 pos 变量导致每轮都从缓冲区开头解析同一帧，永不推进。
+        //   改用 consumed 输出参数 + 显式偏移，与上方 SSL 分支一致，正确逐帧消费。
         size_t pos = 0;
         while (pos < (size_t)n) {
-            size_t old_pos = pos;
-            proto::WSFrame frame = proto::parse_ws_frame((uint8_t*)buf.data() + buf_pos, (size_t)n, pos);
-            if (frame.payload.empty() && old_pos == pos) break;
+            size_t consumed = 0;
+            proto::WSFrame frame = proto::parse_ws_frame((uint8_t*)buf.data() + buf_pos + pos, (size_t)n - pos, consumed);
+            if (consumed == 0) break;  // 数据不足，等待更多数据
+            pos += consumed;
             if (!frame.payload.empty()) {
                 bot_handle_frame(frame.payload);
                 last_ping = util::now_ms();
@@ -1712,11 +1936,6 @@ void YuanbaoServer::bot_ws_recv_loop() {
 
 void YuanbaoServer::bot_handle_frame(const Bytes& data) {
     if (data.empty()) return;
-    
-    std::cerr << "[Bot] RECV " << data.size() << " bytes, hex(前20): ";
-    for (size_t i = 0; i < std::min((size_t)20, data.size()); i++)
-        fprintf(stderr, "%02x", data[i]);
-    fprintf(stderr, "\n");
 
     // 1. 解码外层 ConnMsg（Protobuf）
     proto::DecodedMsg msg = proto::decode_conn_msg(data);
@@ -1727,9 +1946,11 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
         return;
     }
     
-    std::cerr << "[Bot] RECV cmd=" << msg.cmd << " type=" << msg.cmd_type 
-              << " module=" << msg.module << " seq=" << msg.seq_no
-              << " data_len=" << msg.data.size() << "\n";
+    // 移除高频 hex 转储：每帧写 stderr（含成员列表 3KB 字节流）在 5 秒轮询下
+    // 造成严重 IO 开销并放大卡顿，仅保留一次带 seq 的简要摘要供排查
+    if (msg.cmd_type == 2) {
+        // PUSH 消息（群消息等）也走此处，同样仅摘要
+    }
     
     // 2. 根据 cmd_type 处理（与 Python sender.py 完全一致）
     int cmd_type = msg.cmd_type;  // 0=REQUEST, 1=RESPONSE, 2=PUSH
@@ -1784,11 +2005,19 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
         }
         {
             std::lock_guard<std::mutex> l(members_mu_);
-            members_cache_ = std::move(members);
+            // ← 修复：按群分别缓存（切换派后不同群不互相串缓存）
+            std::string g = members_request_group_;
+            if (g.empty()) g = config_.default_target();
+            auto& entry = members_cache_map_[g];
+            entry.members = std::move(members);
+            entry.fetched_at = util::now_ms();
             members_response_ = true;
+            members_fetched_at_ = entry.fetched_at;
         }
         members_cv_.notify_all();
-        std::cerr << "[Bot] get_group_member_list 响应: " << members_cache_.size() << " 人\n";
+        std::lock_guard<std::mutex> l(members_mu_);
+        std::cerr << "[Bot] get_group_member_list 响应(" << members_request_group_
+                  << "): " << members_cache_map_[members_request_group_].members.size() << " 人\n";
         return;
     }
 
@@ -1819,12 +2048,19 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
                 matched = true;
             }
         }
-        // 仅主群查询更新 members_owner_id_/members_group_name_，避免被非主群响应污染
+        // ← 主群概念已移除：查询目标即默认目标群，响应直接更新群信息
         {
             std::lock_guard<std::mutex> l(members_mu_);
-            if (matched && target_group == config_.default_group_code) {
-                if (!owner_id.empty()) members_owner_id_ = owner_id;
-                if (!group_name.empty()) members_group_name_ = group_name;
+            if (matched) {
+                // 按群更新 owner/name（写入该群的成员缓存条目，群信息与成员同群）
+                auto& entry = members_cache_map_[target_group];
+                if (!owner_id.empty()) entry.owner_id = owner_id;
+                if (!group_name.empty()) entry.group_name = group_name;
+                // 兼容旧引用：默认目标群的 owner/name 同步到旧字段
+                if (target_group == config_.default_target()) {
+                    if (!owner_id.empty()) members_owner_id_ = owner_id;
+                    if (!group_name.empty()) members_group_name_ = group_name;
+                }
             }
             if (matched && !group_name.empty())
                 known_groups_[target_group] = group_name;
@@ -1854,6 +2090,25 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
         std::string group_code  = push_json["group_code"].asString();
         std::string msg_id_s    = push_json["msg_id"].asString();
 
+        // ← 修复：撤回事件通知（对齐 Python group_monitor.py 的 Group.CallbackAfterRecallMsg）
+        //   兼容多种回调命令字段名与值，并支持缺失回调字段但含撤回列表结构的兜底判定
+        bool is_recall = false;
+        std::string cb = push_json["callback_command"].asString();
+        if (cb.empty()) cb = push_json["CallbackCommand"].asString();
+        if (cb == "Group.CallbackAfterRecallMsg" || cb == "Group.CallbackAfterRecallMsgEx"
+            || cb == "Group.CallbackRecallMsg") {
+            is_recall = true;
+        } else if (cb.empty()
+                   && (!push_json["recall_msg_seq_list"].arr.empty() || !push_json["MsgSeqList"].arr.empty())
+                   && !push_json["group_code"].asString().empty()) {
+            // 无回调命令字段但结构上确实是撤回事件（含撤回列表 + 群号）
+            is_recall = true;
+        }
+        if (is_recall) {
+            handle_recall_notification(push_json);
+            return;
+        }
+
         // ← 修复：多群聊监听。任何群消息都说明 bot 在该群，先把群号记入 known_groups_；
         //   群名查询统一由 /api/groups 串行处理（按 msg_id 关联），PUSH 不再发异步查询，
         //   避免 PUSH 查询与前端 /api/groups、/api/members 并发导致群名错乱
@@ -1864,12 +2119,17 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
                 if (!known_groups_.count(group_code)) { known_groups_[group_code] = ""; is_new = true; }
             }
             if (is_new) persist_known_groups();   // ← 落盘，重启不丢失
+            // 自动获取监听群：新发现的群自动加入监听列表（除非用户已手动关闭过，
+            // 此时 listen_groups 非空且不含该群，保持用户选择）
+            if (is_new && config_.listen_groups.empty()) {
+                config_.listen_groups.push_back(group_code);
+                save_config();
+            }
         }
-        // ← 修复：按当前监听群过滤（对照 Python group_monitor.py）
-        //   群消息 group_code 非空且不是监听群 → 只记录群、不记录消息，避免账号所在的其他群
-        //   消息被记录/触发 AI 回复（即前端"不存在的消息"的来源）
-        if (!group_code.empty() && !config_.default_group_code.empty()
-            && group_code != config_.default_group_code) {
+        // ← 修复：按监听群列表过滤（多群监听）
+        //   群消息 group_code 非空且不在 listen_groups → 只记录群、不记录消息，避免账号所在的
+        //   其他群消息被记录/触发 AI 回复（即前端"不存在的消息"的来源）
+        if (!group_code.empty() && !config_.is_listening(group_code)) {
             std::cerr << "[Bot] 忽略非监听群消息 (group=" << group_code << ")\n";
             return;
         }
@@ -1888,6 +2148,7 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
         
         // 解析 msg_body（与 Python 一致）
         std::string content;
+        JsonVal media_info;
         if (!push_json["msg_body"].arr.empty()) {
             for (auto& elem : push_json["msg_body"].arr) {
                 std::string mt = elem["msg_type"].asString();
@@ -1895,36 +2156,161 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
                     std::string txt = elem["msg_content"]["text"].asString();
                     if (!txt.empty()) content += txt;
                 } else if (mt == "TIMCustomElem") {
-                    // 可能是 @消息
+                    // ← 修复：对齐 Python _extract_text 的自定义元素处理。
+                    //   elem_type==1002 是 @消息（取 text）；其他类型取 text/content/tips；
+                    //   data 解析失败时追加原始 data 字符串——原实现直接丢弃，
+                    //   导致含自定义元素的消息内容从中间丢失（"从中间被截断"）。
                     std::string ds = elem["msg_content"]["data"].asString();
                     JsonVal cd;
-                    if (json_parse(ds, cd) && cd["elem_type"].asInt() == 1002) {
-                        content += cd["text"].asString() + " ";
+                    if (!ds.empty() && json_parse(ds, cd) && !cd.obj.empty()) {
+                        if (cd["elem_type"].asInt() == 1002) {
+                            std::string t = cd["text"].asString();
+                            if (!t.empty()) content += t + " ";
+                        } else {
+                            std::string t = cd["text"].asString();
+                            if (t.empty()) t = cd["content"].asString();
+                            if (t.empty()) t = cd["tips"].asString();
+                            if (!t.empty()) content += t + " ";
+                        }
+                    } else if (!ds.empty()) {
+                        // 解析失败：保留原始 data，避免内容丢失
+                        content += ds + " ";
                     }
                 } else if (mt == "TIMFaceElem") {
-                    content += "[贴纸]";
+                    // ← 补：解析贴纸 media_info（对齐 Python _extract_media_info）
+                    //   贴纸信息在 msg_content.data 内嵌 JSON：{sticker_id, name, package_id}
+                    std::string face_name;
+                    std::string fd_str = elem["msg_content"]["data"].asString();
+                    if (!fd_str.empty()) {
+                        JsonVal fd;
+                        if (json_parse(fd_str, fd)) {
+                            face_name = fd["name"].asString();
+                            if (face_name.empty()) face_name = fd["face_name"].asString();
+                            media_info["type"] = "sticker";
+                            media_info["sticker_id"] = fd["sticker_id"].asString();
+                            media_info["sticker_name"] = face_name;
+                            media_info["package_id"] = fd["package_id"].asString();
+                        }
+                    }
+                    if (face_name.empty()) face_name = elem["msg_content"]["name"].asString();
+                    content += face_name.empty() ? "[贴纸]" : ("[贴纸:" + face_name + "]");
                 } else if (mt == "TIMImageElem") {
                     content += "[图片]";
+                    // ← 补：解析图片媒体信息，前端可渲染缩略图（对齐 Python media_info）
+                    std::string url;
+                    int iw = 0, ih = 0, isz = 0;
+                    for (auto& ii : elem["msg_content"]["image_info_array"].arr) {
+                        std::string u = ii["url"].asString();
+                        if (!u.empty()) {
+                            url = u;
+                            iw = ii["width"].asInt();
+                            ih = ii["height"].asInt();
+                            isz = ii["size"].asInt();
+                        }
+                    }
+                    if (!url.empty()) {
+                        JsonVal urls;
+                        JsonVal uv; uv.v = url;
+                        urls.arr.push_back(uv);
+                        media_info["type"] = "image";
+                        media_info["image_urls"] = urls;
+                        media_info["image_uuid"] = elem["msg_content"]["uuid"].asString();
+                        media_info["image_width"] = iw;
+                        media_info["image_height"] = ih;
+                        media_info["image_size"] = isz;
+                    }
                 } else if (mt == "TIMFileElem") {
+                    // ← 补：解析文件 media_info（对齐 Python _extract_media_info）
                     std::string fn = elem["msg_content"]["file_name"].asString();
+                    media_info["type"] = "file";
+                    media_info["file_url"] = elem["msg_content"]["url"].asString();
+                    media_info["file_name"] = fn;
+                    media_info["file_uuid"] = elem["msg_content"]["uuid"].asString();
+                    media_info["file_size"] = elem["msg_content"]["file_size"].asInt();
                     content += fn.empty() ? "[文件]" : ("[文件:" + fn + "]");
                 } else if (mt == "TIMVideoFileElem") {
-                    content += "[视频]";
+                    // ← 补：解析视频 media_info（对齐 Python _extract_media_info）
+                    std::string vn = elem["msg_content"]["file_name"].asString();
+                    media_info["type"] = "video";
+                    media_info["url"] = elem["msg_content"]["url"].asString();
+                    media_info["uuid"] = elem["msg_content"]["uuid"].asString();
+                    media_info["size"] = elem["msg_content"]["file_size"].asInt();
+                    media_info["name"] = vn;
+                    content += vn.empty() ? "[视频]" : ("[视频:" + vn + "]");
                 }
             }
         }
         
+        // ← 补：代理转发模式（对齐 Python /auto yb on）
+        //   非默认目标群的群消息转发到默认目标群（监听列表第一项，AI 图片/代理均走此群），
+        //   元宝的回复按 FIFO 顺序回传到原群
+        // ← 主群概念已移除：转发目标改为默认目标群（监听列表第一项）
+        if (forward_enabled_ && !group_code.empty()
+            && sender_id != config_.yuanbao_id
+            && group_code != config_.default_target() && !content.empty()) {
+            bool pass = true;
+            if (forward_at_only_) {
+                // 仅艾特元宝时转发
+                pass = false;
+                for (auto& elem : push_json["msg_body"].arr) {
+                    if (elem["msg_type"].asString() != "TIMCustomElem") continue;
+                    JsonVal cd;
+                    if (json_parse(elem["msg_content"]["data"].asString(), cd)
+                        && cd["elem_type"].asInt() == 1002
+                        && cd["user_id"].asString() == config_.yuanbao_id) { pass = true; break; }
+                }
+            }
+            if (pass) {
+                std::string fwd_text = "[转发] " + sender_name + ": " + content;
+                // forward_at_yuanbao_ 开启时 @元宝，确保元宝回复（对齐 Python 代理模式）
+                bool ok = (forward_at_yuanbao_ && !config_.yuanbao_id.empty())
+                          ? send_group_at(config_.default_target(), fwd_text, config_.yuanbao_id, "元宝")
+                          : send_group_text(config_.default_target(), fwd_text);
+                std::cerr << "[Forward] 转发到 " << config_.default_target()
+                          << " (" << (ok ? "OK" : "FAIL") << ")\n";
+                if (ok) {
+                    std::lock_guard<std::mutex> l(forward_mu_);
+                    forward_queue_.push_back(std::make_pair(group_code, msg_id_s));
+                }
+            }
+        }
+        // ← 补：元宝回复回传（代理转发模式，FIFO 顺序匹配）
+        if (forward_enabled_ && sender_id == config_.yuanbao_id && !content.empty()) {
+            std::string orig_group, ref_id;
+            {
+                std::lock_guard<std::mutex> l(forward_mu_);
+                if (!forward_queue_.empty()) {
+                    orig_group = forward_queue_.front().first;
+                    ref_id = forward_queue_.front().second;
+                    forward_queue_.pop_front();
+                }
+            }
+            if (!orig_group.empty()) {
+                bool ok = send_group_reply(orig_group, content, ref_id);
+                std::cerr << "[Forward] 元宝回复回传 -> " << orig_group
+                          << " (" << (ok ? "OK" : "FAIL") << ")\n";
+            }
+        }
+
         std::cerr << "[Bot] 收到消息: " << sender_name << "(" << sender_id 
                   << ") in " << group_code << ": " << content.substr(0, 80) << "\n";
         
         JsonVal log_entry;
         std::string ts_str = util::time_iso();
         log_entry["msg_id"] = msg_id_s;
+        // ← 修复：缓存 msg_seq（撤回匹配关键字段；兼容大写 MsgSeq，如腾讯云标准）
+        int msg_seq = push_json["msg_seq"].asInt();
+        if (msg_seq <= 0) msg_seq = push_json["MsgSeq"].asInt();
+        if (msg_seq > 0) log_entry["msg_seq"] = msg_seq;
         log_entry["timestamp"] = ts_str;   // 日志用
         log_entry["time"] = ts_str;        // 前端 renderMessages 读 m.time
         log_entry["cmd"] = cmd; log_entry["sender_name"] = sender_name;
         log_entry["sender_id"] = sender_id; log_entry["group_code"] = group_code;
         log_entry["content"] = content;
+        // ← 修复：标识私聊消息（group_code 为空 = C2C 私聊），记录对方 ID 供前端按人过滤历史
+        bool is_c2c = group_code.empty();
+        if (is_c2c) { log_entry["is_c2c"] = true; log_entry["c2c_peer"] = sender_id; }
+        if (!media_info.obj.empty()) log_entry["media_info"] = media_info;
         msg_logger_.log(log_entry); cache_message(log_entry);
         
         JsonVal fe;
@@ -1933,6 +2319,10 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
         fe["group"] = group_code; fe["content"] = content;
         fe["time"] = (double)util::now_ms();
         push_to_frontend("bot_message", fe);
+        // ← 补：插件命令匹配（JSON 配置插件，命令优先于 AI 回复）
+        if (sender_id != config_.yuanbao_id && !content.empty()) {
+            if (handle_plugin_command(group_code, content)) return;
+        }
         if (config_.llm.enabled && !content.empty()) process_llm_reply(log_entry);
         return;
     }
@@ -1943,6 +2333,206 @@ void YuanbaoServer::bot_handle_frame(const Bytes& data) {
         std::cerr << "[Bot] msg: cmd=" << cmd << " module=" << msg.module 
                   << " type=" << cmd_type << " data=" << ds.substr(0, 100) << "\n";
     }
+}
+
+// ← 修复：撤回事件通知（对齐 Python group_monitor.py _send_recall_notification）
+//   兼容多种字段名：群号 group_code/GroupId、撤回者 sender_nickname/Operator_Account、
+//   列表 recall_msg_seq_list/MsgSeqList、条目 msg_seq/MsgSeq、msg_id/MsgId。
+//   撤回的消息若是图片则尝试补发原图，其余情况发送文字通知（含 fence 防渲染）
+void YuanbaoServer::handle_recall_notification(const JsonVal& push_json) {
+    if (!config_.recall_monitor_enabled) {
+        std::cerr << "[Bot] 撤回事件已忽略（撤回监控开关未开启）\n";
+        return;
+    }
+    std::string group_code = push_json["group_code"].asString();
+    if (group_code.empty()) group_code = push_json["GroupId"].asString();
+    if (group_code.empty()) {
+        std::cerr << "[Bot] 撤回事件缺少群号 group_code/GroupId\n";
+        return;
+    }
+    std::string operator_name = push_json["sender_nickname"].asString();
+    if (operator_name.empty()) operator_name = push_json["Operator_Account"].asString();
+    if (operator_name.empty()) operator_name = push_json["from_account"].asString();
+
+    const JsonVal* list = nullptr;
+    if (!push_json["recall_msg_seq_list"].arr.empty()) list = &push_json["recall_msg_seq_list"];
+    else if (!push_json["MsgSeqList"].arr.empty()) list = &push_json["MsgSeqList"];
+    if (!list) {
+        std::cerr << "[Bot] 撤回事件缺少 recall_msg_seq_list/MsgSeqList\n";
+        return;
+    }
+    std::cerr << "[Bot] 撤回事件: group=" << group_code << " 撤回者=" << operator_name
+              << " 条数=" << list->arr.size() << "\n";
+
+    for (auto& item : list->arr) {
+        std::string recalled_id = item["msg_id"].asString();
+        if (recalled_id.empty()) recalled_id = item["MsgId"].asString();
+        int64_t recalled_seq = item["msg_seq"].asInt();
+        if (recalled_seq <= 0) recalled_seq = item["MsgSeq"].asInt();
+
+        // 从消息缓存找回原消息（含 media_info）——按群 + msg_id/msg_seq 双条件匹配
+        JsonVal orig;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> l(msg_mu_);
+            for (auto& m : msg_cache_) {
+                if (m["group_code"].asString() != group_code) continue;
+                if (!recalled_id.empty() && m["msg_id"].asString() == recalled_id) { orig = m; found = true; break; }
+                if (recalled_seq > 0 && m["msg_seq"].asInt() == recalled_seq) { orig = m; found = true; break; }
+            }
+        }
+
+        std::string notif;
+        if (found) {
+            std::string orig_content = orig["content"].asString();
+            std::string orig_sender = orig["sender_name"].asString();
+            if (orig_sender.empty()) orig_sender = orig["sender_id"].asString();
+            std::string orig_time = orig["time"].asString();
+            notif = "—— 撤回通知 ——\n"
+                    "撤回者: " + operator_name + "\n"
+                    "原发送者: " + orig_sender + "\n"
+                    "发送时间: " + orig_time;
+            // 原内容用代码块 fence 包裹防渲染（对齐 group_monitor.py）
+            size_t max_bt = 0, bcount = 0;
+            for (char ch : orig_content) {
+                if (ch == '`') { bcount++; if (bcount > max_bt) max_bt = bcount; }
+                else bcount = 0;
+            }
+            std::string fence = (max_bt >= 3) ? std::string(max_bt + 1, '`') : "```";
+            notif += "\n原内容:\n" + fence + "原内容\n" + orig_content + "\n" + fence;
+
+            // 图片被撤回：尝试补发原图（对齐 Python 自动补发）
+            const JsonVal& mi = orig["media_info"];
+            if (mi["type"].asString() == "image" && !mi["image_urls"].arr.empty()) {
+                std::string url = mi["image_urls"].arr[0].asString();
+                if (!url.empty()) {
+                    bool ok = send_group_image(group_code, url,
+                                               mi["image_uuid"].asString(),
+                                               mi["image_size"].asInt(),
+                                               mi["image_width"].asInt(),
+                                               mi["image_height"].asInt());
+                    std::cerr << "[Bot] 撤回图片补发: " << (ok ? "OK" : "FAIL") << "\n";
+                }
+            }
+        } else {
+            notif = "—— 撤回通知 ——\n撤回了消息\n原内容: [未找到已缓存的消息]";
+        }
+        bool ok = send_group_text(group_code, notif);
+        std::cerr << "[Bot] 撤回通知发送: " << (ok ? "OK" : "FAIL") << "\n";
+    }
+}
+
+// ═══════════════════════════════════════════════
+//  插件系统（JSON 配置插件：plugins/*.json）
+// ═══════════════════════════════════════════════
+void YuanbaoServer::load_plugins() {
+    std::vector<PluginInfo> loaded;
+    namespace fs = std::filesystem;
+    try {
+        if (!fs::exists("plugins")) fs::create_directory("plugins");
+        for (auto& entry : fs::directory_iterator("plugins")) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".json") continue;
+            std::string path = entry.path().string();
+            std::ifstream ifs(path);
+            if (!ifs) continue;
+            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            JsonVal pj;
+            if (!json_parse(content, pj)) {
+                PluginInfo bad;
+                bad.name = entry.path().stem().string();
+                bad.error = "JSON 解析失败: " + path;
+                loaded.push_back(bad);
+                continue;
+            }
+            PluginInfo pi;
+            pi.name = pj["name"].asString();
+            if (pi.name.empty()) pi.name = entry.path().stem().string();
+            pi.version = pj["version"].asString();
+            pi.author = pj["author"].asString();
+            pi.description = pj["description"].asString();
+            pi.active = (pj["active"].is_bool() && pj["active"].asBool())
+                        || (!pj["active"].is_bool() && pj["active"].asString() == "true");
+            for (auto& c : pj["commands"].arr) {
+                PluginCommand pc;
+                pc.command = c["command"].asString();
+                pc.reply = c["reply"].asString();
+                if (!pc.command.empty()) pi.commands.push_back(pc);
+            }
+            if (pi.commands.empty()) pi.error = "无可用命令（commands 为空）";
+            loaded.push_back(pi);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[插件] 扫描 plugins/ 异常: " << e.what() << "\n";
+    }
+    {
+        std::lock_guard<std::mutex> l(plugins_mu_);
+        plugins_ = std::move(loaded);
+    }
+    std::cerr << "[插件] 加载完成，共 " << plugins_.size() << " 个插件\n";
+}
+
+bool YuanbaoServer::save_plugin(const PluginInfo& p) {
+    try {
+        namespace fs = std::filesystem;
+        if (!fs::exists("plugins")) fs::create_directory("plugins");
+        std::ostringstream o;
+        o << "{\n";
+        o << "  \"name\": " << json_quote(p.name) << ",\n";
+        o << "  \"version\": " << json_quote(p.version.empty() ? "1.0.0" : p.version) << ",\n";
+        o << "  \"author\": " << json_quote(p.author) << ",\n";
+        o << "  \"description\": " << json_quote(p.description) << ",\n";
+        o << "  \"active\": " << (p.active ? "true" : "false") << ",\n";
+        o << "  \"commands\": [\n";
+        for (size_t i = 0; i < p.commands.size(); i++) {
+            o << "    {\"command\": " << json_quote(p.commands[i].command)
+              << ", \"reply\": " << json_quote(p.commands[i].reply) << "}";
+            if (i + 1 < p.commands.size()) o << ",";
+            o << "\n";
+        }
+        o << "  ]\n}\n";
+        std::ofstream ofs("plugins/" + p.name + ".json");
+        if (!ofs) return false;
+        ofs << o.str();
+        return true;
+    } catch (...) { return false; }
+}
+
+// 命令匹配：content 以某插件命令前缀开头 → 发送回复。返回是否已处理
+bool YuanbaoServer::handle_plugin_command(const std::string& group, const std::string& content) {
+    if (group.empty() || content.empty()) return false;
+    std::vector<PluginInfo> snapshot;
+    {
+        std::lock_guard<std::mutex> l(plugins_mu_);
+        snapshot = plugins_;
+    }
+    for (auto& p : snapshot) {
+        if (!p.active || p.commands.empty()) continue;
+        for (auto& c : p.commands) {
+            if (c.command.empty()) continue;
+            // 前缀匹配（含纯命令匹配：去掉可能的 @ 等前缀）
+            std::string msg = content;
+            // 去掉开头的 @昵称 片段再匹配（如 "@元宝 /ping"）
+            if (msg.rfind("@", 0) == 0) {
+                size_t sp = msg.find(' ');
+                if (sp != std::string::npos) msg = msg.substr(sp + 1);
+            }
+            if (msg == c.command || msg.rfind(c.command, 0) == 0) {
+                std::string reply = c.reply;
+                // {user} 占位 = 发送者昵称
+                size_t u = reply.find("{user}");
+                if (u != std::string::npos) {
+                    // 需要发送者昵称：简化处理，用「你」代替
+                    reply.replace(u, 6, "你");
+                }
+                bool ok = send_group_text(group, reply);
+                std::cerr << "[插件] " << p.name << " 命令 " << c.command
+                          << " -> 回复 (" << (ok ? "OK" : "FAIL") << ")\n";
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void YuanbaoServer::process_llm_reply(const JsonVal& msg) {
@@ -2140,27 +2730,16 @@ bool YuanbaoServer::bot_connect() {
     std::cerr << "[Bot] ========================================\n";
     return false;
 #else
-    // 若已有连接线程在运行，先安全回收，避免覆盖 joinable 线程导致 std::terminate
-    if (bot_ws_thread_.joinable()) {
-        bot_running_ = false;
-        if (bot_ws_fd_ >= 0) close_socket(bot_ws_fd_);
-#ifndef YUANBAO_NO_OPENSSL
-        if (bot_ws_ssl_) { SSL_shutdown(bot_ws_ssl_); SSL_free(bot_ws_ssl_); bot_ws_ssl_ = nullptr; }
-        if (bot_ws_ssl_ctx_) { SSL_CTX_free(bot_ws_ssl_ctx_); bot_ws_ssl_ctx_ = nullptr; }
-#endif
-        auto t0 = std::chrono::steady_clock::now();
-        while (bot_ws_thread_.joinable() &&
-               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3))
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (bot_ws_thread_.joinable()) bot_ws_thread_.detach();
-        bot_ws_fd_ = -1;
-    }
+    // ← 修复：若连接线程已在运行且未主动断开，直接复用，避免重复调用 /api/connect
+    //   （页面刷新/重复点连接）时杀旧线程 → 重建 → 再杀的循环，该循环造成 Bot
+    //   反复断线重连（SSL 错误 5）与高频查询，是卡顿的重要来源
+    if (bot_running_.load()) return true;
     bot_running_ = true;
     sync_sent_ = false;
     bot_ws_thread_ = std::thread([this]() {
         try {
         int retry = 0;
-        while (retry < 5 && bot_running_.load()) {
+        while (bot_running_.load()) {
             sync_sent_ = false;  // 每次重试重置
             if (!bot_sign_token()) {
                 std::cerr << "[Bot] 鉴权失败，等待重试...\n";
@@ -2205,13 +2784,13 @@ bool YuanbaoServer::bot_connect() {
 #endif
             if (bot_ws_fd_ >= 0) { close_socket(bot_ws_fd_); bot_ws_fd_ = -1; }
             retry++;
-            // 指数退避重试
-            int delay = (retry <= 5) ? (1 << (retry - 1)) : 16;  // 1,2,4,8,16s
+            // 指数退避重试（上限 60s），永不放弃，保证 Bot 断线后自动恢复
+            int delay = (retry <= 5) ? (1 << (retry - 1)) : (retry > 20 ? 60 : 16);  // 1,2,4,8,16,16...60
             std::cerr << "[Bot] " << delay << "s 后重试 (第" << retry << "次)...\n";
             std::this_thread::sleep_for(std::chrono::seconds(delay));
             continue;
         }
-        std::cerr << "[Bot] 连接失败，已达最大重试次数\n";
+        std::cerr << "[Bot] connect 线程退出\n";
         } catch (const std::exception& e) {
             std::cerr << "[Bot] connect 线程异常: " << e.what() << "\n";
         } catch (...) {
@@ -2258,7 +2837,12 @@ void YuanbaoServer::save_config() {
       << "  \"APP_SECRET\": \"" << config_.app_secret << "\",\n"
       << "  \"API_DOMAIN\": \"" << config_.api_domain << "\",\n"
       << "  \"WS_URL\": \"" << config_.ws_url << "\",\n"
-      << "  \"DEFAULT_GROUP_CODE\": \"" << config_.default_group_code << "\",\n"
+      << "  \"LISTEN_GROUPS\": [";
+    for (size_t i = 0; i < config_.listen_groups.size(); i++) {
+        if (i) o << ",";
+        o << "\"" << config_.listen_groups[i] << "\"";
+    }
+    o << "],\n"
       << "  \"YUANBAO_ID\": \"" << config_.yuanbao_id << "\",\n"
       << "  \"HEARTBEAT_INTERVAL\": " << config_.heartbeat_interval << ",\n"
       << "  \"LLM_API_URL\": " << json_quote(config_.llm.api_url) << ",\n"
@@ -2313,6 +2897,25 @@ void YuanbaoServer::load_known_groups() {
             it->second = g["group_name"].asString();
         }
     }
+}
+
+// 自动获取监听群：不依赖 config 硬编码。
+// 仅当 listen_groups 为空（用户未手动配置）时，自动把 bot 已加入的所有群设为监听；
+// 一旦用户手动开关过（listen_groups 非空），保持用户的监听选择，不再全量覆盖。
+void YuanbaoServer::auto_listen_from_known() {
+    bool modified = false;
+    {
+        std::lock_guard<std::mutex> l(members_mu_);
+        if (config_.listen_groups.empty()) {
+            for (auto& kv : known_groups_) {
+                if (!config_.is_listening(kv.first)) {
+                    config_.listen_groups.push_back(kv.first);
+                    modified = true;
+                }
+            }
+        }
+    }
+    if (modified) save_config();
 }
 
 // =====================================================================
@@ -2452,6 +3055,120 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         return HttpResponse().json(o.str());
     }
 
+    // ← 修复：图片代理接口。resourceUrl（hunyuan.tencent.com/api/resource/download?resourceId=...）
+    //   需要 X-Token 鉴权，浏览器 <img> 无法带该头 → 前端图片 404。
+    //   由后端带 X-Token 拉取图片字节返回，前端 <img src="/api/image-proxy?resourceId=...">
+    if (path == "/api/image-proxy") {
+        std::string rid;
+        auto rq = req.query_params.find("resourceId");
+        if (rq != req.query_params.end()) rid = rq->second;
+        if (rid.empty()) {
+            // 兼容完整 url 参数
+            auto uq = req.query_params.find("url");
+            std::string u = (uq != req.query_params.end()) ? uq->second : "";
+            size_t pos = u.find("resourceId=");
+            if (pos != std::string::npos) {
+                rid = u.substr(pos + 11);
+                size_t amp = rid.find('&');
+                if (amp != std::string::npos) rid = rid.substr(0, amp);
+            }
+        }
+        if (rid.empty()) return HttpResponse().json("{\"error\":\"resourceId required\"}");
+        // 解析 API 域名（host/port）
+        std::string host = config_.api_domain, api_path;
+        int port = 443;
+        {
+            std::string d = config_.api_domain;
+            size_t sl = d.find("://");
+            if (sl != std::string::npos) d = d.substr(sl + 3);
+            size_t cl = d.find(':');
+            if (cl != std::string::npos) { port = atoi(d.substr(cl + 1).c_str()); d = d.substr(0, cl); }
+            size_t psl = d.find('/');
+            if (psl != std::string::npos) d = d.substr(0, psl);
+            host = d;
+        }
+        std::map<std::string, std::string> hd;
+        hd["X-ID"] = config_.yuanbao_id;
+        hd["X-Token"] = client_token_;
+        hd["X-Source"] = "web";
+        hd["X-AppVersion"] = "1.0.11";
+        hd["X-OperationSystem"] = "linux";
+        hd["X-Instance-Id"] = "99";
+        hd["X-Bot-Version"] = "2026.3.22";
+        std::string resp;
+        // ← 修复：优先用上传时保存的 COS 凭证构造 GET 签名 URL（key 正确 = 我们上传的 location）。
+        //   v1/download 返回的 realUrl key 与我们上传的不一致（NoSuchKey），不可用。
+        int ret = -1;
+        {
+            std::lock_guard<std::mutex> l(members_mu_);
+            if (!cos_upload_secret_key_.empty() && !cos_upload_location_.empty()
+                && (cos_upload_expired_ == 0 || cos_upload_expired_ > (int64_t)(util::now_ms() / 1000))) {
+                std::string cos_host = cos_upload_bucket_ + ".cos." + cos_upload_region_ + ".myqcloud.com";
+                std::string sign_key = hmac_sha1_hex(cos_upload_secret_key_, cos_upload_key_time_);
+                std::string http_string = "get\n" + cos_upload_location_ + "\n\nhost=" + cos_host + "\n";
+                std::string sts = "sha1\n" + cos_upload_key_time_ + "\n" + sha1_hex(http_string) + "\n";
+                std::string signature = hmac_sha1_hex(sign_key, sts);
+                // ← 修复：签名参数放 Authorization 头（URL 不带 query），与上传一致。
+                //   GET 请求 q-url-param-list 必须为空，URL 不能带签名 query 参数
+                std::string authorization =
+                    "q-sign-algorithm=sha1&q-ak=" + cos_upload_secret_id_ +
+                    "&q-sign-time=" + cos_upload_key_time_ +
+                    "&q-key-time=" + cos_upload_key_time_ +
+                    "&q-header-list=host&q-url-param-list=" +
+                    "&q-signature=" + signature;
+                std::map<std::string, std::string> ch;
+                ch["Authorization"] = authorization;
+                if (!cos_upload_token_.empty()) ch["x-cos-security-token"] = cos_upload_token_;
+                ret = https_request("GET", cos_host, 443, cos_upload_location_,
+                                    "", "", ch, resp, 30000);
+                if (ret != 0 || resp.empty()) ret = -1;
+            }
+        }
+        // 兜底：v1/download（用于 _90 域 QQ 客户端图片）
+        std::string dl;
+        if (ret != 0) {
+            ret = https_request("GET", host, port, "/api/resource/v1/download?resourceId=" + rid,
+                                "", "", hd, dl, 30000);
+        }
+        if (ret == 0 && !dl.empty()) {
+            JsonVal j;
+            if (json_parse(dl, j)) {
+                std::string real = j["realUrl"].asString();
+                if (real.empty()) real = j["url"].asString();
+                JsonVal dj = j["data"];
+                if (real.empty() && !dj.empty()) {
+                    real = dj["url"].asString();
+                    if (real.empty()) real = dj["realUrl"].asString();
+                }
+                if (real.size() > 10) {
+                    // 从 realUrl 解析 host/path 并拉取（COS 直链）
+                    std::string real_host, real_path;
+                    size_t sp = real.find("://");
+                    if (sp != std::string::npos) {
+                        std::string rest = real.substr(sp + 3);
+                        size_t slash = rest.find('/');
+                        real_host = (slash != std::string::npos) ? rest.substr(0, slash) : rest;
+                        real_path = (slash != std::string::npos) ? rest.substr(slash) : "/";
+                    }
+                    if (!real_host.empty())
+                        ret = https_request("GET", real_host, 443, real_path, "", "",
+                                            {}, resp, 30000);
+                }
+            }
+        }
+        if (ret != 0 || resp.empty()) return HttpResponse().json("{\"error\":\"fetch failed\"}");
+        HttpResponse res;
+        res.status = 200;
+        // 简单判断图片类型
+        std::string ct = "image/jpeg";
+        if (resp.size() >= 8 && (uint8_t)resp[0] == 0x89 && (uint8_t)resp[1] == 0x50) ct = "image/png";
+        else if (resp.size() >= 3 && resp.compare(0, 3, "GIF") == 0) ct = "image/gif";
+        res.headers["Content-Type"] = ct;
+        res.headers["Cache-Control"] = "public, max-age=86400";  // 缓存1天
+        res.body_bytes = Bytes(resp.begin(), resp.end());
+        return res;
+    }
+
     // 发送消息
     if (path == "/api/send") {
         JsonVal body;
@@ -2460,10 +3177,53 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string mode = body["mode"].asString();
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             std::string to = body["to"].asString().empty() ? body["target_id"].asString() : body["to"].asString();
             int count = body["count"].asInt(); if (count <= 0) count = 1;
             int interval = (int)(body["interval"].asDouble() * 1000); if (interval < 50) interval = 50;
+
+            // ← 修复：有序片段模式（前端普通模式 @ 用 parts 数组），保持 @ 在输入时的原始位置
+            if (body["parts"].arr.size() > 0) {
+                std::vector<proto::SendPart> parts;
+                for (auto& p : body["parts"].arr) {
+                    proto::SendPart sp;
+                    std::string pt = p["type"].asString();
+                    if (pt == "at") {
+                        sp.type = 1;
+                        sp.user_id = p["user_id"].asString();
+                        sp.display = p["display"].asString();
+                    } else {
+                        sp.text = p["text"].asString();
+                    }
+                    parts.push_back(sp);
+                }
+                bool hasAt = false;
+                for (auto& sp : parts) if (sp.type == 1) { hasAt = true; break; }
+                if (hasAt) {
+                    if (count > 1) {
+                        int sent_ok = 0;
+                        for (int i = 0; i < count; i++) {
+                            if (send_group_parts(group, parts)) sent_ok++;
+                            if (i < count - 1) std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+                        }
+                        return HttpResponse().json("{\"ok\":true,\"at\":true,\"spam\":true,\"count\":" + std::to_string(sent_ok) + "}");
+                    }
+                    bool ok = send_group_parts(group, parts);
+                    return HttpResponse().json("{\"ok\":" + std::string(ok ? "true" : "false") + ",\"at\":true}");
+                }
+                // 无 @ 的纯文本片段：退化为普通群发（含刷屏）
+                std::string ptext;
+                for (auto& sp : parts) ptext += sp.text;
+                if (!ptext.empty()) {
+                    if (count > 1) {
+                        flood_start(ptext, count, interval, 1, "random", group);
+                        return HttpResponse().json("{\"ok\":true,\"spam\":true,\"count\":" + std::to_string(count) + "}");
+                    }
+                    bool ok = send_group_text(group, ptext);
+                    return HttpResponse().json("{\"ok\":" + std::string(ok ? "true" : "false") + ",\"sent_to\":\"" + group + "\"}");
+                }
+                return HttpResponse().json("{\"error\":\"empty parts\"}");
+            }
 
             // @ 某人模式（前端 at / atspam 传 at_user；不回退 target_id，避免拦截私聊模式）
             // 与 Python 版一致：@ 与私聊（send_c2c_message）为独立命令，target_id 仅用于 dm
@@ -2522,7 +3282,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string name = body["name"].asString();
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             std::string sid = stickers_.find_by_name(name);
             if (sid.empty()) return HttpResponse().json("{\"error\":\"sticker not found\"}");
             // 与 Python encode_tim_face_elem 一致：完整 6 字段 JSON
@@ -2533,8 +3293,42 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string at_user = body["at_user"].asString();
             std::string at_nick = body["at_nickname"].asString();
             std::string text = body["text"].asString();
-            bool ok = send_group_sticker(group, sj.str(), at_user, at_nick, text);
-            return HttpResponse().json("{\"ok\":" + std::string(ok ? "true" : "false") + "}");
+            // ← 补：贴纸刷屏（对齐前端 stickerCount / stickerInterval）
+            int count = body["count"].asInt();
+            if (count <= 0) count = 1;
+            double interval = body["interval"].asDouble();
+            if (interval < 0.01) interval = 0.1;
+            if (count > 100) { count = 100; interval = std::max(interval, 0.5); }  // 安全上限
+            // ← 修复：构建贴纸 media_info 供前端实时显示自己发送的贴纸
+            JsonVal mi;
+            mi["type"] = "sticker";
+            mi["sticker_id"] = sid;
+            mi["sticker_name"] = name;
+            mi["package_id"] = "1003";
+            std::string display_text = "[贴纸:" + name + "]";
+            // ← 修复：带 @ 时记录补上 @ 前缀（与收到的 "@昵称 贴纸/文本" 格式一致）
+            if (!at_user.empty()) {
+                std::string at_display = at_nick.empty() ? at_user : at_nick;
+                display_text = "@" + at_display + " " + display_text;
+            }
+            if (!text.empty()) display_text = display_text + " " + text;
+            if (count == 1) {
+                bool ok = send_group_sticker(group, sj.str(), at_user, at_nick, text);
+                if (ok) record_sent_message(group, display_text, mi);
+                return HttpResponse().json("{\"ok\":" + std::string(ok ? "true" : "false") + "}");
+            }
+            // 多次发送：后台线程按间隔循环（不阻塞 HTTP 响应）
+            std::string sj_str = sj.str();
+            std::thread([this, group, sj_str, at_user, at_nick, text, count, interval, display_text, mi]() {
+                int sent_ok = 0;
+                for (int i = 0; i < count; i++) {
+                    if (send_group_sticker(group, sj_str, at_user, at_nick, text)) sent_ok++;
+                    if (i + 1 < count)
+                        std::this_thread::sleep_for(std::chrono::milliseconds((int)(interval * 1000)));
+                }
+                if (sent_ok > 0) record_sent_message(group, display_text, mi);
+            }).detach();
+            return HttpResponse().json("{\"ok\":true,\"count\":" + std::to_string(count) + "}");
         }
         return HttpResponse().json("{\"error\":\"invalid params\"}");
     }
@@ -2553,12 +3347,26 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
                     else if (p.name == "at_nickname") at_nick = p.data;
                 }
                 if (file_data.empty()) return HttpResponse().json("{\"error\":\"no file\"}");
-                if (group.empty()) group = config_.default_group_code;
+                if (group.empty()) group = config_.default_target();
                 if (file_name.empty()) file_name = "image.png";
                 std::string url, uuid;
                 if (!upload_media(file_name, file_data, url, uuid))
                     return HttpResponse().json("{\"error\":\"upload failed\"}");
-                bool ok = send_group_image(group, url, uuid, (int)file_data.size(), 0, 0, at_user, at_nick);
+                // ← 修复：解析图片真实宽高（对齐 Python Image.open 获取宽高），
+                //   w/h 传 0 会导致服务端无法正确生成图片，群里显示 404
+                int img_w = 0, img_h = 0;
+                util::parse_image_dimensions(file_data, img_w, img_h);
+                bool ok = send_group_image(group, url, uuid, (int)file_data.size(), img_w, img_h, at_user, at_nick);
+                // ← 修复：记录自己发送的图片消息（带 media_info），否则消息面板不显示
+                if (ok) {
+                    JsonVal mi;
+                    mi["type"] = "image";
+                    JsonVal urls; JsonVal uv; uv.v = url; urls.arr.push_back(uv);
+                    mi["image_urls"] = urls;
+                    mi["image_uuid"] = uuid;
+                    mi["image_size"] = (int)file_data.size();
+                    record_sent_message(group, "[图片]", mi);
+                }
                 return HttpResponse().json("{\"ok\":" + std::string(ok ? "true" : "false") + "}");
             }
             return HttpResponse().json("{\"error\":\"invalid multipart\"}");
@@ -2568,7 +3376,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string url = body["url"].asString();
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             std::string uuid = body["uuid"].asString();
             int size = body["size"].asInt();
             int w = body["width"].asInt();
@@ -2589,7 +3397,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
                 body["delay"].asInt() > 0 ? body["delay"].asInt() : 50,
                 body["batch"].asInt() > 0 ? body["batch"].asInt() : 3,
                 body["mode"].asString().empty() ? "random" : body["mode"].asString(),
-                body["group_code"].asString().empty() ? (body["group"].asString().empty() ? config_.default_group_code : body["group"].asString()) : body["group_code"].asString()
+                body["group_code"].asString().empty() ? (body["group"].asString().empty() ? config_.default_target() : body["group"].asString()) : body["group_code"].asString()
             );
             return HttpResponse().json("{\"id\":\"" + id + "\"}");
         }
@@ -2606,72 +3414,6 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
     if (path == "/api/flood/stats") return HttpResponse().json(flood_stats());
     if (path == "/api/flood/list") return HttpResponse().json(flood_engine_.list_tasks());
 
-    // 玻璃着色器
-    if (path == "/api/glass/preset") {
-        std::string name = "default";
-        if (!req.query_params.empty()) name = req.query_params.begin()->second;
-        return HttpResponse().json(glass_preset(name));
-    }
-    if (path == "/api/glass/presets") {
-        return HttpResponse().json(glass::GlassShaderEngine::all_presets_json());
-    }
-    if (path == "/api/glass/stats") return HttpResponse().json(glass_stats());
-    if (path == "/api/glass/vertex") return HttpResponse().js(glass::GlassShaderEngine::compile_vertex());
-    if (path == "/api/glass/blur") return HttpResponse().js(glass::GlassShaderEngine::compile_blur());
-    if (path == "/api/glass/composite") return HttpResponse().js(glass::GlassShaderEngine::compile_composite());
-    if (path == "/api/glass/shared") {
-        glass_frame_count_++;
-        return HttpResponse().json("{\"ok\":true,\"shm\":false}");
-    }
-    // ── 液态玻璃高性能组件：C++ 生成位移贴图 / 边缘环遮罩（供前端 feImage 引用）──
-    if (path == "/api/glass/displacement-map") {
-        int w = 128, h = 128;
-        float radius = 18.f, flat = 0.64f, hardness = 0.5f;
-        auto gqi = [&](const std::string& k, int def) {
-            auto it = req.query_params.find(k);
-            return it != req.query_params.end() ? std::atoi(it->second.c_str()) : def;
-        };
-        auto gqf = [&](const std::string& k, float def) {
-            auto it = req.query_params.find(k);
-            return it != req.query_params.end() ? (float)std::atof(it->second.c_str()) : def;
-        };
-        w = gqi("w", w); h = gqi("h", h);
-        radius = gqf("radius", radius); flat = gqf("flat", flat); hardness = gqf("hardness", hardness);
-        if (w < 8 || w > 1024) w = 128;
-        if (h < 8 || h > 1024) h = 128;
-        std::string data_url = glass::DisplacementMapGenerator::generate_png_data_url(
-            w, h, flat, hardness, radius, radius);
-        return HttpResponse().json("{\"ok\":true,\"data_url\":\"" + data_url + "\"}");
-    }
-    if (path == "/api/glass/edge-ring") {
-        int w = 128, h = 128;
-        float radius = 18.f, ring = 4.f, feather = 6.f;
-        auto gqi = [&](const std::string& k, int def) {
-            auto it = req.query_params.find(k);
-            return it != req.query_params.end() ? std::atoi(it->second.c_str()) : def;
-        };
-        auto gqf = [&](const std::string& k, float def) {
-            auto it = req.query_params.find(k);
-            return it != req.query_params.end() ? (float)std::atof(it->second.c_str()) : def;
-        };
-        w = gqi("w", w); h = gqi("h", h);
-        radius = gqf("radius", radius); ring = gqf("ring", ring); feather = gqf("feather", feather);
-        if (w < 8 || w > 1024) w = 128;
-        if (h < 8 || h > 1024) h = 128;
-        std::string data_url = glass::EdgeRingMaskGenerator::generate_ring_png_data_url(
-            w, h, radius, radius, ring, feather);
-        return HttpResponse().json("{\"ok\":true,\"data_url\":\"" + data_url + "\"}");
-    }
-    if (path == "/api/glass/compile") {
-        JsonVal body;
-        if (json_parse(req.body, body)) {
-            std::string shader = glass_compile(json_compact(body));
-            JsonVal sh_root;
-            if (json_parse(shader, sh_root)) return HttpResponse().json(shader);
-        }
-        return HttpResponse().json("{\"error\":\"invalid params\"}");
-    }
-
     // 消息（日志历史在前 + 最新缓存追加在后，对照 Python 版从存储读历史）
     if (path == "/api/messages") {
         int limit = 100;
@@ -2679,11 +3421,21 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         if (qit != req.query_params.end()) { int v = std::atoi(qit->second.c_str()); if (v > 0) limit = v; }
         if (limit > 500) limit = 500;
 
-        // ← 修复：按群过滤。未传 group_code 时默认只返回当前监听群，
-        //   避免消息面板混入其他群（多群监听切换前的遗留群）的历史消息
-        std::string group_filter = config_.default_group_code;
+        // ← 修复：按群过滤。未传 group_code 时返回所有监听群消息
+        //   （此前默认只返回主群，而主群可能无消息，导致"看不到别人消息"）
+        std::string group_filter;
         auto git = req.query_params.find("group_code");
-        if (git != req.query_params.end() && !git->second.empty()) group_filter = git->second;
+        if (git != req.query_params.end()) group_filter = git->second;
+        // ← 补：按私聊对象过滤（c2c_user）——返回与该用户的全部私聊消息（发送+接收）
+        std::string c2c_filter;
+        auto cit = req.query_params.find("c2c_user");
+        if (cit != req.query_params.end()) c2c_filter = cit->second;
+        // 未指定群时允许的群集合 = 所有监听群；指定了群则仅该群
+        std::set<std::string> allow_groups;
+        if (group_filter.empty()) {
+            for (auto& g : config_.listen_groups) allow_groups.insert(g);
+            if (!config_.default_target().empty()) allow_groups.insert(config_.default_target());
+        }
 
         std::vector<JsonVal> all;
         std::set<std::string> seen_ids;
@@ -2710,7 +3462,25 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
                     if (line.empty()) continue;
                     JsonVal v;
                     if (json_parse(line, v)) {
-                        if (!group_filter.empty() && v["group_code"].asString() != group_filter) continue;
+                        // ← 补：私聊过滤优先（c2c_user）——只返回与该用户的私聊消息
+                        if (!c2c_filter.empty()) {
+                            bool is_c2c = v["is_c2c"].asBool();
+                            if (!is_c2c) continue;
+                            std::string peer = v["c2c_peer"].asString();
+                            std::string sender = v["sender_id"].asString();
+                            // 收到的私聊：sender=c2c_peer；发出的私聊：sender=bot, c2c_peer=目标
+                            bool from_peer = (sender == c2c_filter);
+                            bool to_peer = (peer == c2c_filter);
+                            if (!from_peer && !to_peer) continue;
+                        } else {
+                            // 群过滤：指定了 group_code 时仅匹配该群；未指定时只保留监听群消息
+                            if (!group_filter.empty()) {
+                                if (v["group_code"].asString() != group_filter) continue;
+                            } else {
+                                std::string gc = v["group_code"].asString();
+                                if (!allow_groups.count(gc)) continue;
+                            }
+                        }
                         std::string id = v["msg_id"].asString();
                         if (!id.empty()) {
                             if (seen_ids.count(id)) continue;
@@ -2730,7 +3500,21 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         {
             std::lock_guard<std::mutex> l(msg_mu_);
             for (auto& m : msg_cache_) {
-                if (!group_filter.empty() && m["group_code"].asString() != group_filter) continue;
+                if (!c2c_filter.empty()) {
+                    bool is_c2c = m["is_c2c"].asBool();
+                    if (!is_c2c) continue;
+                    std::string peer = m["c2c_peer"].asString();
+                    std::string sender = m["sender_id"].asString();
+                    bool from_peer = (sender == c2c_filter);
+                    bool to_peer = (peer == c2c_filter);
+                    if (!from_peer && !to_peer) continue;
+                } else {
+                    if (!group_filter.empty()) {
+                        if (m["group_code"].asString() != group_filter) continue;
+                    } else {
+                        if (!allow_groups.count(m["group_code"].asString())) continue;
+                    }
+                }
                 std::string id = m["msg_id"].asString();
                 if (!id.empty()) {
                     if (seen_ids.count(id)) continue;
@@ -2743,9 +3527,13 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         size_t start = all.size() > (size_t)limit ? all.size() - (size_t)limit : 0;
         std::ostringstream oss; oss << "{\"ok\":true,\"messages\":[";
         bool first = true;
+        // ← 修复：为每条消息附加 list_index（在当前群完整列表中的绝对位置）。
+        //   前端引用回复时回传该值，后端据此精确定位，杜绝"序号与后端 index 不一致"。
         for (size_t i = start; i < all.size(); i++) {
             if (!first) oss << ","; first = false;
-            oss << json_compact(all[i]);
+            JsonVal out = all[i];
+            out["list_index"] = (double)i;
+            oss << json_compact(out);
         }
         oss << "]}"; return HttpResponse().json(oss.str());
     }
@@ -2784,8 +3572,6 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             << ",\"bot_id\":\"" << config_.yuanbao_id << "\""
             << ",\"flood_active\":" << fs.active_tasks
             << ",\"flood_total_sent\":" << flood_total_sent_.load()
-            << ",\"glass_compile\":" << glass_compile_count_.load()
-            << ",\"glass_frame\":" << glass_frame_count_.load()
             << ",\"msg_cache\":" << msg_cache_.size()
             << ",\"msg_written\":" << msg_logger_.total_written.load()
             << ",\"logger_written\":" << msg_logger_.total_written.load()
@@ -2794,7 +3580,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             << ",\"forward_at_only\":" << (forward_at_only_ ? "true" : "false")
             << ",\"forward_at_yuanbao\":" << (forward_at_yuanbao_ ? "true" : "false")
             << ",\"heartbeat_interval\":" << config_.heartbeat_interval
-            << ",\"current_group\":\"" << config_.default_group_code << "\""
+            << ",\"current_group\":\"" << config_.default_target() << "\""
             << ",\"msg_log_enabled\":" << (config_.msg_log_enabled ? "true" : "false")
             << ",\"recall_monitor_enabled\":" << (config_.recall_monitor_enabled ? "true" : "false")
             << ",\"llm_enabled\":" << (config_.llm.enabled ? "true" : "false")
@@ -2806,14 +3592,39 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
 
     // 贴纸列表
     if (path == "/api/stickers") {
-        // 前端 loadStickers() 读取 r.stickers
+        // 前端 loadStickers() 读取 r.stickers；每个贴纸附带 icon（本地 ico 图标 URL，无则空）
         std::ostringstream oss; oss << "{\"stickers\":[";
         bool first = true;
         for (auto& kv : stickers_.stickers) {
             if (!first) oss << ","; first = false;
-            oss << "{\"name\":\"" << kv.first << "\",\"id\":\"" << kv.second << "\"}";
+            oss << "{\"name\":" << json_quote(kv.first)
+                << ",\"id\":\"" << kv.second << "\"";
+            std::string ifile = stickers_.icon_file(kv.first);
+            if (!ifile.empty()) {
+                oss << ",\"icon\":\"/api/sticker-icon?name=" << util::url_encode(kv.first) << "\"";
+            } else {
+                oss << ",\"icon\":\"\"";
+            }
+            oss << "}";
         }
         oss << "]}"; return HttpResponse().json(oss.str());
+    }
+
+    // 本地贴纸图标（按名称返回 ico 二进制，供前端 <img> 直接显示）
+    if (path == "/api/sticker-icon") {
+        auto qit = req.query_params.find("name");
+        if (qit == req.query_params.end() || qit->second.empty())
+            return HttpResponse().bad_request();
+        std::string ifile = stickers_.icon_file(qit->second);
+        if (ifile.empty()) return HttpResponse().not_found();
+        std::string data;
+        if (!util::read_file_utf8("ico/" + ifile, data) || data.empty())
+            return HttpResponse().not_found();
+        HttpResponse r;
+        r.body = data;
+        r.headers["Content-Type"] = "image/x-icon";
+        r.headers["Cache-Control"] = "public, max-age=86400";
+        return r;
     }
 
     // ── 转发模式 ──
@@ -2907,16 +3718,68 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         JsonVal body;
         if (json_parse(req.body, body)) {
             std::string text = body["text"].asString();
-            std::string group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            // ← 修复：兼容 api() 统一注入的 group_code，回复也发到当前查看的群
+            std::string group = body["group_code"].asString();
+            if (group.empty()) group = body["group"].asString();
+            if (group.empty()) group = config_.default_target();
             std::string ref_id = body["ref_msg_id"].asString();
-            // 前端可能只传 index（消息序号）：从消息缓存查对应 msg_id
+            // 前端可能只传 index（消息序号）：从「当前群」消息缓存查对应 msg_id。
+            // ← 修复：原先直接索引全局 msg_cache_[idx]，多群监听时序号与前端
+            //   （按群过滤的日志+缓存合并列表）错位。现按与 /api/messages 相同
+            //   的顺序（日志在前 + 缓存追加在后、按群过滤、去重）重建列表再索引。
+            //   前端优先回传 list_index（/api/messages 返回的完整列表绝对位置），
+            //   该值与下面重建的列表一一对应，彻底杜绝序号错位。
             if (ref_id.empty()) {
-                int idx = body["index"].asInt();
+                int idx = body.obj.count("list_index") ? body["list_index"].asInt() : body["index"].asInt();
                 if (idx >= 0) {
-                    std::lock_guard<std::mutex> l(msg_mu_);
-                    if ((size_t)idx < msg_cache_.size())
-                        ref_id = msg_cache_[idx]["msg_id"].asString();
+                    std::vector<JsonVal> log_msgs;
+                    std::set<std::string> seen_ids;
+                    DIR* d0 = opendir("logs");
+                    if (d0) {
+                        struct dirent* ent;
+                        std::vector<std::string> logfiles;
+                        while ((ent = readdir(d0))) {
+                            std::string n = ent->d_name;
+                            if (n.rfind("messages_", 0) == 0 && n.size() > 4
+                                && n.compare(n.size() - 4, 4, ".log") == 0)
+                                logfiles.push_back(n);
+                        }
+                        closedir(d0);
+                        std::sort(logfiles.begin(), logfiles.end());
+                        for (auto& fn : logfiles) {
+                            std::ifstream f(std::string("logs/") + fn);
+                            std::string line;
+                            while (std::getline(f, line)) {
+                                if (line.empty()) continue;
+                                JsonVal v;
+                                if (json_parse(line, v)) {
+                                    if (!group.empty() && v["group_code"].asString() != group) continue;
+                                    std::string id = v["msg_id"].asString();
+                                    if (!id.empty()) {
+                                        if (seen_ids.count(id)) continue;
+                                        seen_ids.insert(id);
+                                    }
+                                    log_msgs.push_back(v);
+                                }
+                            }
+                        }
+                    }
+                    // 与 /api/messages 相同的组合：日志在前 + 缓存追加在后（去重）
+                    std::vector<JsonVal> combined = log_msgs;
+                    {
+                        std::lock_guard<std::mutex> l(msg_mu_);
+                        for (auto& m : msg_cache_) {
+                            if (!group.empty() && m["group_code"].asString() != group) continue;
+                            std::string id = m["msg_id"].asString();
+                            if (!id.empty()) {
+                                if (seen_ids.count(id)) continue;
+                                seen_ids.insert(id);
+                            }
+                            combined.push_back(m);
+                        }
+                    }
+                    if ((size_t)idx < combined.size())
+                        ref_id = combined[idx]["msg_id"].asString();
                 }
             }
             std::string at_user = body["at_user"].asString();
@@ -2931,7 +3794,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         if (json_parse(req.body, body)) {
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             bool ok = send_group_at_all(group);
             std::ostringstream o;
             o << "{\"ok\":" << (ok ? "true" : "false")
@@ -2945,7 +3808,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
     // ── 群聊/成员 ──
     if (path == "/api/groups") {
         // 前端 loadGroups() 使用 g.group_code / g.group_name
-        // ← 修复：返回主群 + 所有已发现群（PUSH 实时收集 + 持久文件/历史日志恢复）
+        // ← 修复：返回所有已发现群（PUSH 实时收集 + 持久文件/历史日志恢复）
         if (!groups_scanned_) {
             load_known_groups();   // ← 先恢复持久化的群列表
             std::set<std::string> codes;
@@ -2970,25 +3833,37 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
                 }
                 closedir(d0);
             }
-            std::lock_guard<std::mutex> l(members_mu_);
-            for (auto& c : codes) if (!known_groups_.count(c)) known_groups_[c] = "";
-            groups_scanned_ = true;
+            {
+                std::lock_guard<std::mutex> l(members_mu_);
+                for (auto& c : codes) if (!known_groups_.count(c)) known_groups_[c] = "";
+                groups_scanned_ = true;
+            }
+            // 自动获取监听群：listen_groups 为空时全量同步所有已发现群（不硬编码）
+            // ← 修复：必须在锁作用域外调用（其内部会再次获取 members_mu_，
+            //   std::mutex 不可重入，原代码导致同一线程自死锁，/api/groups 永久挂起）
+            auto_listen_from_known();
         }
-        // 组装群列表：主群第一（群名优先从 known_groups_ 读缓存），其余按群号排序
+        // 组装群列表：默认目标群（监听列表第一项）置顶，其余按群号排序
         std::vector<std::pair<std::string, std::string>> groups;
         {
             std::lock_guard<std::mutex> l(members_mu_);
             std::string main_name;
-            auto mit = known_groups_.find(config_.default_group_code);
+            auto mit = known_groups_.find(config_.default_target());
             if (mit != known_groups_.end()) main_name = mit->second;
+            if (main_name.empty()) {
+                auto eit = members_cache_map_.find(config_.default_target());
+                if (eit != members_cache_map_.end()) main_name = eit->second.group_name;
+            }
             if (main_name.empty()) main_name = members_group_name_;
-            groups.push_back({config_.default_group_code, main_name});
+            // 无监听群时 default_target() 为空，不加入空群项
+            if (!config_.default_target().empty())
+                groups.push_back({config_.default_target(), main_name});
             for (auto& kv : known_groups_) {
-                if (kv.first == config_.default_group_code) continue;
+                if (kv.first == config_.default_target()) continue;
                 groups.push_back(kv);
             }
         }
-        // 未获取到群名的群逐个查询（主群优先，串行等待；已缓存的直接跳过）
+        // 未获取到群名的群逐个查询（默认目标群优先，串行等待；已缓存的直接跳过）
         // 每个查询登记 msg_id -> group，响应按 msg_id 精确回写，多请求并发也不张冠李戴
         if (bot_connected_.load()) {
             for (auto& g : groups) {
@@ -3006,7 +3881,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
                 }
                 std::unique_lock<std::mutex> l(members_mu_);
                 members_cv_.wait_for(l, std::chrono::milliseconds(1200),
-                                     [this]{ return group_info_response_; });
+                                     [this]{ return group_info_response_ || !bot_connected_.load(); });
                 auto it = known_groups_.find(g.first);
                 if (it != known_groups_.end() && !it->second.empty()) g.second = it->second;
             }
@@ -3019,24 +3894,58 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             if (!first) o << ","; first = false;
             o << "{\"group_code\":\"" << g.first << "\",\"group_name\":"
               << json_quote(g.second.empty() ? g.first : g.second)
+              << ",\"listening\":" << (config_.is_listening(g.first) ? "true" : "false")
               << ",\"message_count\":0,\"last_message\":\"\"}";
         }
-        o << "],\"current_group\":\"" << config_.default_group_code << "\"}";
+        o << "],\"current_group\":\"" << config_.default_target() << "\",\"listen_groups\":[";
+        first = true;
+        for (auto& g : config_.listen_groups) {
+            if (!first) o << ","; first = false;
+            o << "\"" << g << "\"";
+        }
+        o << "]}";
         return HttpResponse().json(o.str());
     }
     if (path == "/api/groups/switch") {
         JsonVal body;
         if (json_parse(req.body, body)) {
-            config_.default_group_code = body["group_code"].asString();
+            std::string code = body["group_code"].asString();
+            if (code.empty()) return HttpResponse().json("{\"error\":\"group_code required\"}");
+            // ← 主群概念已移除：current_group 固定为监听列表第一项，切换群仅作前端查看状态；
+            //   这里清除旧群信息缓存，使成员/群信息下次查询重新获取
             save_config();
-            // ← 修复：切换群后清除旧群信息缓存（群名/群主/成员），下次查询重新获取
+            // ← 修复：切换查看的群后清除该群缓存（群名/群主/成员），下次查询重新获取；
+            //   其他群的缓存保留，避免无谓重查
             {
                 std::lock_guard<std::mutex> l(members_mu_);
-                members_group_name_.clear();
-                members_owner_id_.clear();
-                members_cache_.clear();
+                members_cache_map_.erase(code);
+                if (code == config_.default_target()) {
+                    members_group_name_.clear();
+                    members_owner_id_.clear();
+                }
             }
             return HttpResponse().json("{\"ok\":true}");
+        }
+        return HttpResponse().json("{\"error\":\"invalid params\"}");
+    }
+    if (path == "/api/groups/listen") {
+        // 多群监听开关：{ group_code, listen:true/false }
+        JsonVal body;
+        if (json_parse(req.body, body)) {
+            std::string code = body["group_code"].asString();
+            bool listen = (body["listen"].is_bool() && body["listen"].asBool())
+                          || (!body["listen"].is_bool() && body["listen"].asString() == "true");
+            if (code.empty()) return HttpResponse().json("{\"error\":\"group_code required\"}");
+            auto it = std::find(config_.listen_groups.begin(), config_.listen_groups.end(), code);
+            bool currently = it != config_.listen_groups.end();
+            if (listen && !currently) {
+                config_.listen_groups.push_back(code);
+            } else if (!listen && currently) {
+                // ← 主群概念已移除：任何群都可取消监听
+                config_.listen_groups.erase(it);
+            }
+            save_config();
+            return HttpResponse().json("{\"ok\":true,\"listening\":" + std::string(listen ? "true" : "false") + "}");
         }
         return HttpResponse().json("{\"error\":\"invalid params\"}");
     }
@@ -3045,46 +3954,116 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         if (!bot_connected_.load()) {
             return HttpResponse().json("{\"ok\":false,\"message\":\"Bot 未连接，请先连接\"}");
         }
+        // ← 修复：支持按群查询成员（group_code 参数），切换派后成员随群刷新；
+        //   未指定时回退默认目标群
+        std::string target_group = config_.default_target();
+        auto mq = req.query_params.find("group_code");
+        if (mq != req.query_params.end() && !mq->second.empty()) target_group = mq->second;
+        // ← 修复：成员列表按群缓存（7s）。前端每 5 秒轮询 loadMembers()，每次都重新向 Bot
+        //   查询群信息+成员列表（阻塞 3s+3s 等待响应），造成请求风暴与卡顿。
+        //   7 秒内同群复用缓存，避免高频轮询打满 Bot 通道；缓存按群区分不串群。
+        {
+            std::lock_guard<std::mutex> l(members_mu_);
+            auto it = members_cache_map_.find(target_group);
+            if (it != members_cache_map_.end()
+                && !it->second.members.empty()
+                && util::now_ms() - it->second.fetched_at < 7000) {
+                auto& entry = it->second;
+                std::ostringstream o;
+                o << "{\"ok\":true,\"cached\":true,\"members\":[";
+                bool first = true;
+                for (auto& m : entry.members) {
+                    if (!first) o << ","; first = false;
+                    o << "{\"user_id\":\"" << m.first << "\",\"nick_name\":"
+                      << json_quote(m.second.empty() ? m.first : m.second) << "}";
+                }
+                o << "],\"total\":" << entry.members.size()
+                  << ",\"group_owner_user_id\":\"" << entry.owner_id << "\"}";
+                return HttpResponse().json(o.str());
+            }
+        }
+        // 查询流程串行化：多个 HTTP 请求（loadMembers/loadGroups 轮询、切换群）同时
+        // 操作 group_info_response_/members_response_ 标志会导致响应张冠李戴、超时返回空。
+        // ← 修复：用 try_lock 非阻塞获取。若另一个成员查询（含发送 @ 消息后的 loadMembers）
+        //   正在进行中，不排队等待（避免 3s+3s 阻塞让前端像"卡死"），直接回退已有缓存。
+        {
+            std::unique_lock<std::mutex> qlock(members_query_mu_, std::try_to_lock);
+            if (!qlock.owns_lock()) {
+                std::lock_guard<std::mutex> l(members_mu_);
+                auto it = members_cache_map_.find(target_group);
+                if (it != members_cache_map_.end() && !it->second.members.empty()) {
+                    auto& entry = it->second;
+                    std::ostringstream o;
+                    o << "{\"ok\":true,\"cached\":true,\"stale\":true,\"members\":[";
+                    bool first = true;
+                    for (auto& m : entry.members) {
+                        if (!first) o << ","; first = false;
+                        o << "{\"user_id\":\"" << m.first << "\",\"nick_name\":"
+                          << json_quote(m.second.empty() ? m.first : m.second) << "}";
+                    }
+                    o << "],\"total\":" << entry.members.size()
+                      << ",\"group_owner_user_id\":\"" << entry.owner_id << "\"}";
+                    return HttpResponse().json(o.str());
+                }
+                return HttpResponse().json("{\"ok\":false,\"message\":\"成员查询进行中，请稍后\"}");
+            }
+            // 查询主体继续用 qlock（随作用域结束释放）：记录该群旧缓存后执行查询
+            std::lock_guard<std::mutex> l(members_mu_);
+            members_request_group_ = target_group;
+        }
         std::string qid = util::random_hex_id();   // 群信息查询关联 ID
-        // 1) 查询群信息以获取群主 user_id（登记 msg_id，响应按 msg_id 精确关联主群）
+        // 1) 查询群信息以获取群主 user_id（登记 msg_id，响应按 msg_id 精确关联目标群）
         {
             std::lock_guard<std::mutex> l(members_mu_);
             group_info_response_ = false;
-            pending_query_groups_[qid] = config_.default_group_code;
+            pending_query_groups_[qid] = target_group;
         }
-        if (!bot_ws_send_bytes(bot_ws_build_query_group_info_msg(config_.default_group_code, qid))) {
+        if (!bot_ws_send_bytes(bot_ws_build_query_group_info_msg(target_group, qid))) {
             std::lock_guard<std::mutex> l(members_mu_);
             pending_query_groups_.erase(qid);
             return HttpResponse().json("{\"ok\":false,\"message\":\"群信息请求发送失败\"}");
         }
         {
             std::unique_lock<std::mutex> l(members_mu_);
-            members_cv_.wait_for(l, std::chrono::seconds(3), [this]{ return group_info_response_; });
+            members_cv_.wait_for(l, std::chrono::seconds(3), [this]{ return group_info_response_ || !bot_connected_.load(); });
         }
+        // 等待期间 Bot 已断开：立即返回，避免 HTTP 请求挂起导致前端一直转圈
+        if (!bot_connected_.load())
+            return HttpResponse().json("{\"ok\":false,\"message\":\"Bot 连接已断开\"}");
         // 2) 查询成员列表
         {
             std::lock_guard<std::mutex> l(members_mu_);
             members_response_ = false;
         }
-        if (!bot_ws_send_bytes(bot_ws_build_get_members_msg(config_.default_group_code)))
+        if (!bot_ws_send_bytes(bot_ws_build_get_members_msg(target_group)))
             return HttpResponse().json("{\"ok\":false,\"message\":\"成员请求发送失败\"}");
         {
             std::unique_lock<std::mutex> l(members_mu_);
-            members_cv_.wait_for(l, std::chrono::seconds(3), [this]{ return members_response_; });
+            members_cv_.wait_for(l, std::chrono::seconds(3), [this]{ return members_response_ || !bot_connected_.load(); });
         }
-        // 3) 组装返回
-        std::lock_guard<std::mutex> l(members_mu_);
-        std::ostringstream o;
-        o << "{\"ok\":true,\"members\":[";
-        bool first = true;
-        for (auto& m : members_cache_) {
-            if (!first) o << ","; first = false;
-            o << "{\"user_id\":\"" << m.first << "\",\"nick_name\":"
-              << json_quote(m.second.empty() ? m.first : m.second) << "}";
+        // 3) 组装返回：优先返回本次成功查询的缓存；查询超时（响应标志未置位）时回退旧缓存
+        {
+            std::lock_guard<std::mutex> l(members_mu_);
+            auto it = members_cache_map_.find(target_group);
+            const auto* entry = (it != members_cache_map_.end()) ? &it->second : nullptr;
+            std::ostringstream o;
+            bool fresh = members_response_;
+            o << "{\"ok\":true,\"cached\":" << (fresh ? "false" : "true")
+              << ",\"stale\":" << (fresh ? "false" : "true") << ",\"members\":[";
+            bool first = true;
+            if (entry) {
+                for (auto& m : entry->members) {
+                    if (!first) o << ","; first = false;
+                    o << "{\"user_id\":\"" << m.first << "\",\"nick_name\":"
+                      << json_quote(m.second.empty() ? m.first : m.second) << "}";
+                }
+                o << "],\"total\":" << entry->members.size()
+                  << ",\"group_owner_user_id\":\"" << entry->owner_id << "\"}";
+            } else {
+                o << "],\"total\":0,\"group_owner_user_id\":\"\"}";
+            }
+            return HttpResponse().json(o.str());
         }
-        o << "],\"total\":" << members_cache_.size()
-          << ",\"group_owner_user_id\":\"" << members_owner_id_ << "\"}";
-        return HttpResponse().json(o.str());
     }
 
     // ── 心跳 ──
@@ -3111,8 +4090,8 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         // 前端 loadSettings() 使用的字段：group_code/default_group、port、
         // heartbeat_interval、forward_mode_enabled、forward_at_only、forward_at_yuanbao、msg_log_enabled
         std::ostringstream o;
-        o << "{\"default_group\":\"" << config_.default_group_code << "\","
-          << "\"group_code\":\"" << config_.default_group_code << "\","
+        o << "{\"default_group\":\"" << config_.default_target() << "\","
+          << "\"group_code\":\"" << config_.default_target() << "\","
           << "\"port\":" << config_.port << ","
           << "\"heartbeat_interval\":" << config_.heartbeat_interval << ","
           << "\"forward_enabled\":" << (forward_enabled_ ? "true" : "false") << ","
@@ -3128,10 +4107,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         // forward_mode_enabled/forward_at_only/forward_at_yuanbao/msg_log_enabled
         JsonVal body;
         if (json_parse(req.body, body)) {
-            if (!body["group_code"].asString().empty())
-                config_.default_group_code = body["group_code"].asString();
-            if (!body["default_group"].asString().empty())
-                config_.default_group_code = body["default_group"].asString();
+            // ← 主群概念已移除：不再接受 default_group/group_code，默认目标群由监听列表第一项决定
             if (body["port"].asInt() >= 1)
                 config_.port = body["port"].asInt();
             if (body.obj.count("heartbeat_interval") > 0)
@@ -3221,12 +4197,22 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
                     else if (p.name == "at_nickname") at_nick = p.data;
                 }
                 if (file_data.empty()) return HttpResponse().json("{\"error\":\"no file\"}");
-                if (group.empty()) group = config_.default_group_code;
+                if (group.empty()) group = config_.default_target();
                 if (file_name.empty()) file_name = "file.bin";
                 std::string url, uuid;
                 if (!upload_media(file_name, file_data, url, uuid))
                     return HttpResponse().json("{\"error\":\"upload failed\"}");
                 bool ok = send_group_file(group, url, file_name, uuid, (int)file_data.size(), at_user, at_nick);
+                // ← 修复：记录自己发送的文件消息（带 media_info），否则消息面板不显示
+                if (ok) {
+                    JsonVal mi;
+                    mi["type"] = "file";
+                    mi["file_url"] = url;
+                    mi["file_name"] = file_name;
+                    mi["file_uuid"] = uuid;
+                    mi["file_size"] = (int)file_data.size();
+                    record_sent_message(group, "[文件:" + file_name + "]", mi);
+                }
                 return HttpResponse().json("{\"ok\":" + std::string(ok ? "true" : "false") + "}");
             }
             return HttpResponse().json("{\"error\":\"invalid multipart\"}");
@@ -3236,7 +4222,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string url = body["url"].asString();
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             std::string file_name = body["file_name"].asString();
             if (file_name.empty()) file_name = body["name"].asString();
             std::string uuid = body["uuid"].asString();
@@ -3253,7 +4239,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string text = body["text"].asString();
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             std::string user_id = body["user_id"].asString();
             if (user_id.empty()) user_id = body["at_user_id"].asString();
             if (user_id.empty()) user_id = body["target_id"].asString();
@@ -3271,7 +4257,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
             std::string text = body["text"].asString();
             std::string group = body["group_code"].asString();
             if (group.empty()) group = body["group"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             std::vector<std::pair<std::string, std::string>> at_users;
             if (body["user_ids"].arr.size() > 0) {
                 for (auto& uid : body["user_ids"].arr)
@@ -3295,7 +4281,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         // 前端 sendAtAll() 读取 diag.connected / diag.group_code
         std::ostringstream o;
         o << "{\"ok\":true,\"connected\":" << (bot_connected_.load() ? "true" : "false")
-          << ",\"group_code\":\"" << config_.default_group_code << "\"}";
+          << ",\"group_code\":\"" << config_.default_target() << "\"}";
         return HttpResponse().json(o.str());
     }
     if (path == "/api/send/ai-image") {
@@ -3303,7 +4289,7 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         if (json_parse(req.body, body)) {
             std::string prompt = body["prompt"].asString();
             std::string group = body["group_code"].asString();
-            if (group.empty()) group = config_.default_group_code;
+            if (group.empty()) group = config_.default_target();
             if (!prompt.empty()) {
                 send_group_text(group, "[AI图片请求] " + prompt);
                 return HttpResponse().json("{\"ok\":true,\"message\":\"AI图片已请求\"}");
@@ -3312,25 +4298,100 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
         return HttpResponse().json("{\"error\":\"prompt required\"}");
     }
     if (path == "/api/plugins") {
-        return HttpResponse().json("{\"ok\":true,\"plugins\":[]}");
+        std::ostringstream o;
+        o << "{\"ok\":true,\"plugins\":[";
+        std::lock_guard<std::mutex> pl(plugins_mu_);
+        for (size_t i = 0; i < plugins_.size(); i++) {
+            auto& p = plugins_[i];
+            o << "{"
+              << "\"name\":" << json_quote(p.name) << ","
+              << "\"version\":" << json_quote(p.version.empty() ? "1.0.0" : p.version) << ","
+              << "\"author\":" << json_quote(p.author) << ","
+              << "\"description\":" << json_quote(p.description) << ","
+              << "\"active\":" << (p.active ? "true" : "false") << ","
+              << "\"error\":" << json_quote(p.error) << ","
+              << "\"message_handlers\":" << p.commands.size() << ","
+              << "\"routes\":" << p.commands.size() << ","
+              << "\"pages\":[],\"cards\":[]"
+              << "}";
+            if (i + 1 < plugins_.size()) o << ",";
+        }
+        o << "]}";
+        return HttpResponse().json(o.str());
     }
     if (path == "/api/plugins/install") {
         JsonVal body;
-        std::string p = "plugin";
         if (json_parse(req.body, body)) {
+            std::string name = body["name"].asString();
+            std::string content = body["content"].asString();
             std::string url = body["url"].asString();
-            size_t pos = url.find_last_of('/');
-            if (pos != std::string::npos) p = url.substr(pos + 1);
-            while (!p.empty() && (p.back() == '.' || p.back() == '/')) p.pop_back();
+            if (content.empty() && !url.empty()) {
+                // 从 URL 下载 JSON 插件（raw JSON 或 github raw）
+                std::string host, path2 = "/", body2;
+                size_t scheme = url.find("://");
+                size_t slash = url.find('/', (scheme == std::string::npos) ? 0 : scheme + 3);
+                if (slash == std::string::npos) { host = url.substr(scheme == std::string::npos ? 0 : scheme + 3); }
+                else {
+                    host = url.substr(scheme == std::string::npos ? 0 : scheme + 3, slash - (scheme == std::string::npos ? 0 : scheme + 3));
+                    path2 = url.substr(slash);
+                }
+                if (!host.empty()) {
+                    int ret = https_request("GET", host, 443, path2, "", "application/json", {}, content, 20000);
+                    if (ret != 0) return HttpResponse().json("{\"error\":\"下载失败\"}");
+                }
+            }
+            JsonVal pj;
+            if (content.empty() || !json_parse(content, pj)) {
+                return HttpResponse().json("{\"error\":\"插件内容不是有效 JSON（格式见 README 插件生态章节）\"}");
+            }
+            PluginInfo pi;
+            pi.name = pj["name"].asString();
+            if (pi.name.empty()) pi.name = name;
+            if (pi.name.empty()) pi.name = "plugin";
+            pi.version = pj["version"].asString();
+            pi.author = pj["author"].asString();
+            pi.description = pj["description"].asString();
+            pi.active = (pj["active"].is_bool() && pj["active"].asBool())
+                        || (!pj["active"].is_bool() && pj["active"].asString() != "false");
+            for (auto& c : pj["commands"].arr) {
+                PluginCommand pc;
+                pc.command = c["command"].asString();
+                pc.reply = c["reply"].asString();
+                if (!pc.command.empty()) pi.commands.push_back(pc);
+            }
+            if (pi.commands.empty()) return HttpResponse().json("{\"error\":\"插件缺少 commands（命令列表）\"}");
+            // 若同名插件已存在则先禁用替换
+            if (!save_plugin(pi)) return HttpResponse().json("{\"error\":\"保存插件文件失败\"}");
+            load_plugins();
+            return HttpResponse().json("{\"ok\":true,\"plugin\":\"" + pi.name + "\"}");
         }
-        return HttpResponse().json("{\"ok\":true,\"plugin\":\"" + p + "\"}");
+        return HttpResponse().json("{\"error\":\"invalid params\"}");
     }
-    if (path == "/api/plugins/toggle" || path == "/api/plugins/reload") {
+    if (path == "/api/plugins/toggle") {
+        JsonVal body;
+        if (json_parse(req.body, body)) {
+            std::string name = body["name"].asString();
+            bool enabled = (body["enabled"].is_bool() && body["enabled"].asBool())
+                           || (!body["enabled"].is_bool() && body["enabled"].asString() == "true");
+            std::lock_guard<std::mutex> pl(plugins_mu_);
+            for (auto& p : plugins_) {
+                if (p.name == name) {
+                    p.active = enabled;
+                    save_plugin(p);
+                    return HttpResponse().json("{\"ok\":true}");
+                }
+            }
+            return HttpResponse().json("{\"error\":\"插件不存在\"}");
+        }
+        return HttpResponse().json("{\"error\":\"invalid params\"}");
+    }
+    if (path == "/api/plugins/reload") {
+        load_plugins();
         return HttpResponse().json("{\"ok\":true}");
     }
     if (path.find("/api/group/name") == 0) {
         std::ostringstream o;
-        o << "{\"ok\":true,\"group_name\":\"" << config_.default_group_code << "\"}";
+        o << "{\"ok\":true,\"group_name\":\"" << config_.default_target() << "\"}";
         return HttpResponse().json(o.str());
     }
 
@@ -3342,10 +4403,16 @@ HttpResponse YuanbaoServer::route_api(const HttpRequest& req) {
 // =====================================================================
 
 // 安全发送 HTTP 响应并在完成后关闭连接
+// ← 修复：原先单次 send() 发送整个响应，大响应（如 base64 图片）可能被截断。
+//   现改为循环发送直至全部送出（兼容部分系统/浏览器一次只收部分数据）。
 static void http_respond_and_close(int fd, const Bytes& data) {
     if (data.empty()) { close_socket(fd); return; }
-    int total_sent = send(fd, (const char*)data.data(), (int)data.size(), 0);
-    (void)total_sent;
+    size_t sent_total = 0;
+    while (sent_total < data.size()) {
+        int n = send(fd, (const char*)data.data() + sent_total, (int)(data.size() - sent_total), 0);
+        if (n <= 0) break;   // 连接中断
+        sent_total += (size_t)n;
+    }
     close_socket(fd);
 }
 
@@ -3441,14 +4508,15 @@ void YuanbaoServer::route_http(int fd) {
         }
 
         // API 路由
-        if (req.path.rfind("/api", 0) == 0 || req.path.rfind("/flood", 0) == 0 ||
-            req.path.rfind("/glass", 0) == 0) {
+        if (req.path.rfind("/api", 0) == 0 || req.path.rfind("/flood", 0) == 0) {
             auto resp = route_api(req);
             auto http_resp = build_http_response_bytes(resp);
             http_respond_and_close(fd, http_resp); return;
         }
 
         // 静态文件
+        // ← 修复：加 Cache-Control: no-cache，防止浏览器缓存旧版 index.html/app.js/style.css
+        //   （曾导致"主题切换无效"、改版不生效等问题；服务端每次从磁盘读最新文件）
         std::string fp = resolve_path(req.path);
         if (!fp.empty()) {
             std::ifstream f(fp, std::ios::binary);
@@ -3458,6 +4526,9 @@ void YuanbaoServer::route_http(int fd) {
                 r.body = content;
                 r.headers["Content-Type"] = util::mime_type(fp);
                 r.headers["Access-Control-Allow-Origin"] = "*";
+                r.headers["Cache-Control"] = "no-cache, must-revalidate";
+                r.headers["Pragma"] = "no-cache";
+                r.headers["Connection"] = "close";
                 auto http_resp = build_http_response_bytes(r);
                 http_respond_and_close(fd, http_resp); return;
             }
@@ -3471,6 +4542,10 @@ void YuanbaoServer::route_http(int fd) {
                 HttpResponse r;
                 r.body = content;
                 r.headers["Content-Type"] = "text/html; charset=utf-8";
+                r.headers["Access-Control-Allow-Origin"] = "*";
+                r.headers["Cache-Control"] = "no-cache, must-revalidate";
+                r.headers["Pragma"] = "no-cache";
+                r.headers["Connection"] = "close";
                 auto http_resp = build_http_response_bytes(r);
                 http_respond_and_close(fd, http_resp); return;
             }
@@ -3536,7 +4611,7 @@ void YuanbaoServer::route_websocket(int fd, const HttpRequest& req) {
                     } else if (action == "send") {
                         std::string text2 = req_json["text"].asString();
                         std::string group = req_json["group"].asString();
-                        if (group.empty()) group = config_.default_group_code;
+                        if (group.empty()) group = config_.default_target();
                         bool ok = send_group_text(group, text2);
                         out["type"] = "sent"; out["ok"] = ok;
                     } else if (action == "flood_start") {
@@ -3545,18 +4620,12 @@ void YuanbaoServer::route_websocket(int fd, const HttpRequest& req) {
                             req_json["count"].asInt() > 0 ? req_json["count"].asInt() : 20,
                             req_json["delay"].asInt() > 0 ? req_json["delay"].asInt() : 50,
                             3, req_json["mode"].asString().empty() ? "random" : req_json["mode"].asString(),
-                            req_json["group"].asString().empty() ? config_.default_group_code : req_json["group"].asString()
+                            req_json["group"].asString().empty() ? config_.default_target() : req_json["group"].asString()
                         );
                         out["type"] = "flood_started"; out["id"] = id;
                     } else if (action == "flood_cancel") {
                         flood_cancel(req_json["id"].asString());
                         out["type"] = "flood_cancelled";
-                    } else if (action == "glass_compile") {
-                        std::string shader = glass_compile(
-                            req_json["params"].asString().empty() ? "{}" : req_json["params"].asString()
-                        );
-                        JsonVal sh_root;
-                        if (json_parse(shader, sh_root)) out = sh_root;
                     } else if (action == "bot_status") {
                         out["type"] = "bot_status";
                         out["connected"] = bot_connected_.load();
@@ -3578,7 +4647,7 @@ void YuanbaoServer::route_websocket(int fd, const HttpRequest& req) {
 }
 
 // =====================================================================
-//  Flood / Glass 实现
+//  Flood 实现
 // =====================================================================
 std::string YuanbaoServer::flood_start(const std::string& text, int count, int delay,
                                         int batch, const std::string& mode,
@@ -3620,23 +4689,6 @@ std::string YuanbaoServer::flood_stats() {
     return oss.str();
 }
 
-std::string YuanbaoServer::glass_compile(const std::string& params_json) {
-    glass_compile_count_++;
-    return glass::GlassShaderEngine::compile_full(params_json);
-}
-
-std::string YuanbaoServer::glass_preset(const std::string& name) {
-    return glass::GlassShaderEngine::compile_preset(name);
-}
-
-std::string YuanbaoServer::glass_stats() {
-    std::ostringstream oss;
-    oss << "{\"compile_count\":" << glass_compile_count_.load()
-        << ",\"frame_count\":" << glass_frame_count_.load()
-        << ",\"shm\":false}";
-    return oss.str();
-}
-
 // =====================================================================
 //  构造 / 析构
 // =====================================================================
@@ -3652,7 +4704,7 @@ bool YuanbaoServer::load_config(const std::string& path) {
     std::cout << "  AppKey: " << config_.app_key.substr(0, 8) << "...\n";
     std::cout << "  API: " << config_.api_domain << "\n";
     std::cout << "  WS: " << config_.ws_url << "\n";
-    std::cout << "  默认群: " << config_.default_group_code << "\n";
+    std::cout << "  默认目标群: " << config_.default_target() << "\n";
 
     if (config_.llm.enabled) {
         std::cout << "  LLM 已启用: " << config_.llm.model << "\n";
@@ -3671,6 +4723,12 @@ bool YuanbaoServer::start(int port) {
     flood_set_sender([this](const std::string& group, const std::string& text) {
         send_group_text(group, text);
     });
+
+    // 加载 JSON 配置插件（plugins/*.json）
+    load_plugins();
+
+    // ← 补：扫描 ico 目录，建立贴纸名称 → 本地图标 映射（前端贴纸图标改用本地 ico）
+    stickers_.scan_icons("ico");
 
     listen_fd_ = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) return false;
@@ -3727,7 +4785,6 @@ bool YuanbaoServer::start(int port) {
     std::cout << "------------------------------------------------------------\n";
     std::cout << "  No Python - Pure C++\n";
     std::cout << "  /api/flood/*     Flood engine (15 text transforms)\n";
-    std::cout << "  /api/glass/*     Glassmorphism GLSL shaders\n";
     std::cout << "  /api/connect     Connect Yuanbao WebSocket\n";
     std::cout << "  /api/send        Send messages\n";
     std::cout << "  /api/stickers    Sticker library (80+ stickers)\n";

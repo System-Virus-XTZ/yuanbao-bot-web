@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<!-- 专业增强版（全功能 / 完整特效与主题）：包含全场景液态玻璃、各厂商主题（PHONE_EFFECTS）、动态背景（视频/自定义图片）、🌌 鸿蒙空间光感、🖼️ 在线图片编辑器（ImgEditor）等全部能力 -->
+<!-- 专业增强版（全功能 / 完整特效与主题）：包含各厂商主题（PHONE_EFFECTS）、动态背景（视频/自定义图片）、🌌 鸿蒙空间光感、🖼️ 在线图片编辑器（ImgEditor）等全部能力 -->
 <html lang="zh-CN" data-theme="light">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>元宝 Bot 6.0</title>
+    <title>元宝 Bot c++ 1.0.1</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,15 +12,18 @@
 <div class="app">
     <nav class="global-nav">
         <div class="nav-left">
-            <span class="nav-title">🤖 元宝 Bot c++ 1.0.0</span>
-        </div>
-        <div class="nav-right">
-            <button class="theme-toggle" id="moreToggle" title="设置" onclick="toggleSettings()">⋯</button>
+            <span class="nav-title">🤖 元宝 Bot c++ 1.0.1</span>
             <button class="theme-toggle" id="themeToggle" title="切换外观" onclick="toggleTheme()">☀️</button>
+            <button class="nav-connect-btn" id="btnConnect" onclick="connect()">🔗 连接</button>
+            <button class="nav-connect-btn" id="btnDisconnect" onclick="disconnect()" disabled>🔌 断开</button>
             <div class="nav-status">
                 <span id="statusText">未连接</span>
                 <span class="status-dot" id="statusDot"></span>
             </div>
+        </div>
+        <div class="nav-right">
+            <button class="theme-toggle" id="historyToggle" title="消息历史记录" onclick="toggleHistoryModal()">🕐</button>
+            <button class="theme-toggle" id="groupInfoToggle" title="当前派信息" onclick="toggleGroupInfoModal()">⋯</button>
         </div>
     </nav>
 
@@ -28,66 +31,27 @@
         <!-- 消息面板（三栏：多群聊监听 | 消息 | 成员） -->
         <div class="tab-page active" id="tab-messages">
             <div class="messages-layout">
+            <!-- 左栏折叠后，栏位上显示的恢复按钮 -->
+            <button class="col-restore-tab col-restore-tab-groups" onclick="restoreColumn('groups')" title="显示元宝派">元宝派</button>
             <!-- ── 左栏：多群聊监听 ── -->
             <aside class="msg-col msg-col-groups">
                 <div class="settings-section">
-                    <h3>🎧 元宝派</h3>
+                    <h3 class="col-title"><button class="panel-back" onclick="closeSidePanels()" title="返回消息">←</button><span>元宝派</span><button class="col-collapse" onclick="toggleColumn('groups')" title="折叠/展开">⟨</button></h3>
                     <div id="groupsList" class="member-list" style="max-height:300px;overflow-y:auto">
                         <div class="empty-state">暂无群聊数据</div>
                     </div>
-                    <div class="action-row">
-                        <button class="btn btn-outline btn-small" onclick="loadGroups()">🔄 刷新群聊列表</button>
-                    </div>
                 </div>
             </aside>
+            <!-- 中栏折叠后，栏位上显示的恢复按钮 -->
+            <button class="col-restore-tab col-restore-tab-messages" onclick="restoreColumn('messages')" title="显示消息">消息</button>
             <!-- ── 中栏：消息 ── -->
             <main class="msg-col msg-col-messages">
-            <div class="action-row">
-                <button class="btn btn-success btn-small" id="btnConnect" onclick="connect()">🔗 连接</button>
-                <button class="btn btn-danger btn-small" id="btnDisconnect" onclick="disconnect()" disabled>🔌 断开</button>
-                <button class="btn btn-outline btn-small" onclick="loadRecentMessages()">🔄 刷新</button>
-                <button class="btn btn-outline btn-small" onclick="clearMessages()">🗑️ 清空</button>
-                <label class="auto-refresh-toggle" title="每 2 秒自动刷新">
-                    <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
-                    <span class="auto-refresh-label">自动</span>
-                </label>
-            </div>
-            <!-- 永久置顶工具栏（搜索 + 群切换）—— 不随消息滚动而消失 -->
-            <div class="messages-toolbar">
-                <div class="action-row">
-                    <div class="form-group" style="flex: 1;">
-                        <input type="text" class="form-input" id="searchMessage" placeholder="🔍 搜索消息..." oninput="filterMessagesDebounced()">
-                    </div>
-                    <select class="form-input" style="width: 130px;" id="msgLimit" onchange="loadRecentMessages()">
-                        <option value="50">最近50条</option>
-                        <option value="100">最近100条</option>
-                        <option value="200">最近200条</option>
-                        <option value="500" selected>最近500条</option>
-                    </select>
-                </div>
-                <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;padding:0 4px">
-                    💡 前端最多缓存 <strong>500 条</strong>实时消息 · 全部消息已自动写入本地 <code>logs/</code> 目录（不限制数量）
-                </div>
-            </div>
+            <h3 class="col-title msg-col-title"><button class="panel-back" onclick="closeSidePanels()" title="返回消息">←</button><span>💬 消息</span><button class="col-collapse" onclick="toggleColumn('messages')" title="折叠/展开">⟩</button></h3>
             <div id="messageLog" class="message-log">
                 <div class="empty-state">暂无消息<br><small>连接后消息会自动显示在这里</small></div>
             </div>
         <!-- 发送面板（悬浮于消息之上） -->
         <div id="sendSection" class="send-section">
-<div class="mode-chips" id="modeChips">
-                <button class="chip active" data-mode="normal" onclick="setMode('normal')">💬 普通</button>
-                <button class="chip" data-mode="at" onclick="setMode('at')">@ 艾特</button>
-                <button class="chip" data-mode="spam" onclick="setMode('spam')">🔁 刷屏</button>
-                <button class="chip" data-mode="atspam" onclick="setMode('atspam')">@🔁 艾特刷屏</button>
-                <button class="chip" data-mode="multi-at" onclick="setMode('multi-at')">👥 批量@</button>
-                <button class="chip" data-mode="dm" onclick="setMode('dm')">✉️ 私聊</button>
-                <button class="chip" data-mode="dmspam" onclick="setMode('dmspam')">📨 私聊刷屏</button>
-                <button class="chip" data-mode="latex" onclick="setMode('latex')">∑ LaTeX 消息</button>
-                <button class="chip" data-mode="latex-spam" onclick="setMode('latex-spam')">∑🔁 LaTeX 刷屏</button>
-                <button class="chip" data-mode="media" onclick="setMode('media')">🖼️ 图片/文件</button>
-                <button class="chip" data-mode="sticker" onclick="setMode('sticker')">😀 贴纸</button>
-            </div>
-
             <div class="form-group" id="targetRow" style="display:none">
                 <label class="form-label" id="targetLabel">目标用户</label>
                 <div style="display: flex; gap: 8px; align-items: center;">
@@ -105,88 +69,6 @@
                 <div class="setting-row">
                     <span class="setting-label">间隔(秒)</span>
                     <input type="number" class="form-input" id="inputInterval" value="0.1" min="0.01" step="0.1" style="max-width: 120px;">
-                </div>
-            </div>
-
-            <!-- 艾特全体（仅在「@ 艾特」模式下显示） -->
-            <div class="settings-section" id="atAllRow" style="display:none">
-                <h3>⚠️ 艾特全体</h3>
-                <div class="form-group">
-                    <textarea class="form-input" id="atAllText" placeholder="输入消息..." rows="2"></textarea>
-                </div>
-                <button class="btn btn-danger btn-block" onclick="sendAtAll()">🚨 艾特全体成员</button>
-            </div>
-
-            <!-- LaTeX 编辑器（v6.0：从旧版移植）-->
-            <div class="form-group" id="latexControls" style="display:none">
-                <h3>∑ LaTeX 消息编辑器</h3>
-                <div class="form-group">
-                    <label class="form-label">输入文本</label>
-                    <input type="text" class="form-input" id="latexText" placeholder="输入要转换为 LaTeX 的文本" value="测试">
-                </div>
-                <div class="latex-controls">
-                    <div class="latex-control-group">
-                        <label class="latex-control-label">
-                            <span>缩放倍数</span>
-                            <span class="latex-control-value" id="scaleValue">3.0</span>
-                        </label>
-                        <input type="range" class="latex-slider" id="scaleSlider" min="0.1" max="100" step="0.1" value="3.0">
-                    </div>
-                    <div class="latex-control-group">
-                        <label class="latex-control-label">
-                            <span>旋转角度</span>
-                            <span class="latex-control-value" id="rotateValue">15°</span>
-                        </label>
-                        <input type="range" class="latex-slider" id="rotateSlider" min="-180" max="180" step="1" value="15">
-                    </div>
-                    <div class="latex-control-group">
-                        <label class="latex-control-label">
-                            <span>字体样式</span>
-                            <span class="latex-control-value" id="fontStyleValue">常规</span>
-                        </label>
-                        <select class="latex-select" id="fontStyleSelect">
-                            <option value="normal">常规</option>
-                            <option value="bold">粗体 \mathbf</option>
-                            <option value="italic">斜体 \mathit</option>
-                            <option value="bold-italic">粗斜体 \boldsymbol</option>
-                        </select>
-                    </div>
-                    <div class="latex-control-group">
-                        <label class="latex-control-label">
-                            <span>水平缩放</span>
-                            <span class="latex-control-value" id="hScaleValue">1.0</span>
-                        </label>
-                        <input type="range" class="latex-slider" id="hScaleSlider" min="0.1" max="5" step="0.1" value="1.0">
-                    </div>
-                    <div class="latex-control-group">
-                        <label class="latex-control-label">
-                            <span>垂直缩放</span>
-                            <span class="latex-control-value" id="vScaleValue">1.0</span>
-                        </label>
-                        <input type="range" class="latex-slider" id="vScaleSlider" min="0.1" max="5" step="0.1" value="1.0">
-                    </div>
-                    <div class="latex-control-group">
-                        <div class="latex-checkbox-group">
-                            <input type="checkbox" class="latex-checkbox" id="borderCheckbox">
-                            <label for="borderCheckbox">添加边框 \fbox</label>
-                        </div>
-                    </div>
-                </div>
-                <div class="latex-preview-container">
-                    <div class="latex-preview-title">实时预览</div>
-                    <div class="latex-preview-box" id="latexPreview">$\scalebox{3.0}{\rotatebox{15}{测试}}$</div>
-                </div>
-                <div class="latex-code-container">
-                    <div class="latex-preview-title">生成的 LaTeX 代码</div>
-                    <textarea class="latex-code-box" id="latexCode" readonly rows="2">$\scalebox{3.0}{\rotatebox{15}{测试}}$</textarea>
-                </div>
-                <div class="latex-action-buttons">
-                    <button class="btn btn-success btn-small" onclick="addToLatexList()">添加到消息列表</button>
-                    <button class="btn btn-outline btn-small" onclick="clearLatexSettings()">重置设置</button>
-                </div>
-                <div class="latex-list-container" id="latexListContainer" style="display:none">
-                    <div class="latex-preview-title">消息列表（可调整顺序）</div>
-                    <div id="latexList"></div>
                 </div>
             </div>
 
@@ -287,6 +169,31 @@
             </div>
 
             <div class="settings-section">
+                <h3>🎬 发送视频</h3>
+                <div class="form-group">
+                    <label class="form-label">选择视频</label>
+                    <div class="file-input-wrapper">
+                        <input type="file" id="videoFile" accept="video/*" style="display:none" onchange="handleVideoSelect(event)">
+                        <label for="videoFile" class="file-input-label" id="videoFileLabel">
+                            <span class="file-icon">🎬</span>
+                            <span class="file-name">点击选择视频...</span>
+                            <button class="btn btn-outline btn-small" onclick="event.preventDefault();document.getElementById('videoFile').click()">选择视频</button>
+                        </label>
+                    </div>
+                </div>
+                <div class="file-info" id="videoInfo" style="display:none">
+                    <span class="file-size" id="videoSize"></span>
+                    <span class="file-type" id="videoType"></span>
+                </div>
+                <div class="file-actions">
+                    <input type="text" class="form-input" id="videoAtUser" placeholder="@ 用户ID（可选）" style="flex: 1;">
+                    <input type="text" class="form-input" id="videoAtNick" placeholder="显示昵称（可选）" style="flex: 0.8;">
+                    <button class="btn btn-primary" id="btnSendVideo" onclick="sendVideo()">发送视频</button>
+                </div>
+                <small style="color:var(--text-muted);display:block;margin-top:4px">视频以文件消息形式发送（MP4/MOV 等，最大20MB，建议压缩后再发）</small>
+            </div>
+
+            <div class="settings-section">
                 <h3>🎨 AI 生成图片</h3>
                 <div class="form-group">
                     <label class="form-label">输入提示词（描述你想要生成的图片）</label>
@@ -330,9 +237,106 @@
             <div id="sendTextArea">
             <div class="form-group">
                 <label class="form-label">消息内容</label>
-                <textarea class="form-input" id="inputMessage" placeholder="输入要发送的消息..." rows="3"></textarea>
+                <div class="at-input-wrap">
+                    <textarea class="form-input" id="inputMessage" placeholder="输入 @ 弹出候选框选择用户，支持 @昵称:显示名 内容（内容可选）" rows="3"></textarea>
+                    <!-- ← 补：输入框内快捷按钮（左下角：图片/文件/贴纸；右下角：圆形发送） -->
+                    <div class="input-quick-actions">
+                        <button type="button" class="quick-action-btn" title="发送图片" onclick="openQuickMedia('image')">🖼️</button>
+                        <button type="button" class="quick-action-btn" title="发送文件" onclick="openQuickMedia('file')">📎</button>
+                        <button type="button" class="quick-action-btn" title="发送贴纸" onclick="openQuickSticker()">😀</button>
+                    </div>
+                    <button type="button" class="quick-send-btn" title="发送" onclick="sendMessage()">📤</button>
+                    <div id="atSuggestBox" class="at-suggest-box" style="display:none"></div>
+                    <!-- ← 补：贴纸选择小窗（点击😀弹出，仿@候选框） -->
+                    <div id="stickerPopover" class="at-suggest-box sticker-popover" style="display:none"></div>
+                </div>
             </div>
-            <button class="btn btn-primary btn-block" id="btnSend" onclick="sendMessage()">📤 发送</button>
+            <!-- ← 修改：发送按钮已移到输入框左下角（圆形），高级选项在最下方 -->
+            <div class="settings-section" id="advOptions" style="margin-top:12px">
+                <h3 class="adv-toggle" onclick="toggleAdvOptions()" title="点击展开/折叠">⚙️ 高级选项 <span id="advCaret" style="float:right">▸</span></h3>
+                <div id="advOptionsBody" style="display:none">
+                    <div class="setting-row" style="margin-top:12px">
+                        <span class="setting-label">刷屏次数</span>
+                        <input type="number" class="form-input" id="advCount" value="1" min="1" style="max-width:120px">
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">间隔(秒)</span>
+                        <input type="number" class="form-input" id="advInterval" value="0.5" min="0.05" step="0.1" style="max-width:120px">
+                    </div>
+                    <!-- ← 修改：LaTeX 编辑器移入普通模式高级选项 -->
+                    <div class="form-group" id="latexControls">
+                        <h3>∑ LaTeX 消息编辑器</h3>
+                        <div class="form-group">
+                            <label class="form-label">输入文本</label>
+                            <input type="text" class="form-input" id="latexText" placeholder="输入要转换为 LaTeX 的文本" value="测试">
+                        </div>
+                        <div class="latex-controls">
+                            <div class="latex-control-group">
+                                <label class="latex-control-label">
+                                    <span>缩放倍数</span>
+                                    <span class="latex-control-value" id="scaleValue">3.0</span>
+                                </label>
+                                <input type="range" class="latex-slider" id="scaleSlider" min="0.1" max="100" step="0.1" value="3.0">
+                            </div>
+                            <div class="latex-control-group">
+                                <label class="latex-control-label">
+                                    <span>旋转角度</span>
+                                    <span class="latex-control-value" id="rotateValue">15°</span>
+                                </label>
+                                <input type="range" class="latex-slider" id="rotateSlider" min="-180" max="180" step="1" value="15">
+                            </div>
+                            <div class="latex-control-group">
+                                <label class="latex-control-label">
+                                    <span>字体样式</span>
+                                    <span class="latex-control-value" id="fontStyleValue">常规</span>
+                                </label>
+                                <select class="latex-select" id="fontStyleSelect">
+                                    <option value="normal">常规</option>
+                                    <option value="bold">粗体 \mathbf</option>
+                                    <option value="italic">斜体 \mathit</option>
+                                    <option value="bold-italic">粗斜体 \boldsymbol</option>
+                                </select>
+                            </div>
+                            <div class="latex-control-group">
+                                <label class="latex-control-label">
+                                    <span>水平缩放</span>
+                                    <span class="latex-control-value" id="hScaleValue">1.0</span>
+                                </label>
+                                <input type="range" class="latex-slider" id="hScaleSlider" min="0.1" max="5" step="0.1" value="1.0">
+                            </div>
+                            <div class="latex-control-group">
+                                <label class="latex-control-label">
+                                    <span>垂直缩放</span>
+                                    <span class="latex-control-value" id="vScaleValue">1.0</span>
+                                </label>
+                                <input type="range" class="latex-slider" id="vScaleSlider" min="0.1" max="5" step="0.1" value="1.0">
+                            </div>
+                            <div class="latex-control-group">
+                                <div class="latex-checkbox-group">
+                                    <input type="checkbox" class="latex-checkbox" id="borderCheckbox">
+                                    <label for="borderCheckbox">添加边框 \fbox</label>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="latex-preview-container">
+                            <div class="latex-preview-title">实时预览</div>
+                            <div class="latex-preview-box" id="latexPreview">$\scalebox{3.0}{\rotatebox{15}{测试}}$</div>
+                        </div>
+                        <div class="latex-code-container">
+                            <div class="latex-preview-title">生成的 LaTeX 代码</div>
+                            <textarea class="latex-code-box" id="latexCode" readonly rows="2">$\scalebox{3.0}{\rotatebox{15}{测试}}$</textarea>
+                        </div>
+                        <div class="latex-action-buttons">
+                            <button class="btn btn-success btn-small" onclick="addToLatexList()">添加到消息列表</button>
+                            <button class="btn btn-outline btn-small" onclick="clearLatexSettings()">重置设置</button>
+                        </div>
+                        <div class="latex-list-container" id="latexListContainer" style="display:none">
+                            <div class="latex-preview-title">消息列表（可调整顺序）</div>
+                            <div id="latexList"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
             </div>
         </div>
             </main>
@@ -340,17 +344,18 @@
             <!-- ── 右栏：成员管理 ── -->
             <aside class="msg-col msg-col-members">
                 <div class="settings-section">
-                    <h3>👥 成员</h3>
+                    <h3 class="col-title"><button class="panel-back" onclick="closeSidePanels()" title="返回消息">←</button><span>成员</span><span id="memberCountBadge" class="member-count-badge"></span><button class="col-collapse" onclick="toggleColumn('members')" title="折叠/展开">⟩</button></h3>
                     <!-- 成员子面板 -->
                     <div class="panel-content active" id="panel-group-members">
                         <div class="action-row">
                             <input type="text" class="form-input" style="flex:1" id="memberSearch" placeholder="🔍 搜索成员..." oninput="filterMembersDebounced()">
-                            <button class="btn btn-primary btn-small" onclick="loadMembers()">🔄 刷新</button>
                         </div>
-                        <div class="member-list" id="memberList"><div class="empty-state">点击刷新获取成员</div></div>
+                        <div class="member-list" id="memberList"><div class="empty-state">暂无成员数据</div></div>
                     </div>
                 </div>
             </aside>
+            <!-- 右栏折叠后，栏位上显示的恢复按钮 -->
+            <button class="col-restore-tab col-restore-tab-members" onclick="restoreColumn('members')" title="显示成员">成员</button>
             </div>
         </div>
 
@@ -363,14 +368,7 @@
                 </div>
                 <div class="mode-chips" id="composerModeChips" style="margin-bottom:14px">
                     <button class="chip active" data-mode="normal" onclick="setComposerMode('normal')">💬 普通</button>
-                    <button class="chip" data-mode="at" onclick="setComposerMode('at')">@ 艾特</button>
-                    <button class="chip" data-mode="spam" onclick="setComposerMode('spam')">🔁 刷屏</button>
-                    <button class="chip" data-mode="atspam" onclick="setComposerMode('atspam')">@🔁 艾特刷屏</button>
-                    <button class="chip" data-mode="multi-at" onclick="setComposerMode('multi-at')">👥 批量@</button>
-                    <button class="chip" data-mode="dm" onclick="setComposerMode('dm')">✉️ 私聊</button>
-                    <button class="chip" data-mode="dmspam" onclick="setComposerMode('dmspam')">📨 私聊刷屏</button>
                     <button class="chip" data-mode="latex" onclick="setComposerMode('latex')">∑ LaTeX</button>
-                    <button class="chip" data-mode="latex-spam" onclick="setComposerMode('latex-spam')">∑🔁 LaTeX 刷屏</button>
                 </div>
                 <div class="form-group" id="composerTargetRow" style="display:none">
                     <label class="form-label">目标用户</label>
@@ -404,22 +402,35 @@
 
 
 
-        <!-- 设置面板 -->
-        <div class="tab-page" id="tab-settings">
+        <!-- 当前派信息弹窗 -->
+        <div class="modal-overlay" id="groupInfoModal" onclick="if(event.target===this)closeGroupInfoModal()">
+            <div class="modal-box group-info-modal-box">
+                <div class="modal-header">
+                    <span class="modal-title">🎧 当前派信息</span>
+                    <button class="modal-close" onclick="closeGroupInfoModal()">&times;</button>
+                </div>
+                <div class="group-info-body" id="groupInfoBody">
+                    <div class="group-info-row"><span class="group-info-label">派名称</span><span class="group-info-value" id="ginfoName">-</span></div>
+                    <div class="group-info-row"><span class="group-info-label">派号</span><span class="group-info-value" id="ginfoCode">-</span></div>
+                    <div class="group-info-row"><span class="group-info-label">Bot 昵称</span><span class="group-info-value" id="ginfoBotName">-</span></div>
+                    <div class="group-info-row"><span class="group-info-label">派人数</span><span class="group-info-value" id="ginfoMemberCount">-</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 设置面板（弹窗） -->
+        <div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)closeSettingsModal()">
+            <div class="modal-box settings-modal-box">
+                <div class="modal-header">
+                    <span class="modal-title">⚙️ 设置</span>
+                    <button class="modal-close" onclick="closeSettingsModal()">&times;</button>
+                </div>
+                <div class="settings-modal-scroll">
             <!-- ══════════ 设置功能 ══════════ -->
-            <div style="margin-top:24px;padding-top:16px;border-top:2px dashed var(--border)">
-            <div class="settings-section" style="border:1px solid var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 18%,transparent)">
+            <div style="margin-top:4px;padding-top:4px">
+            <div class="settings-section" style="border:1px solid var(--primary);box-shadow:0 0 0 3px rgba(30,144,255,.18)">
                 <h3>⚙️ 常用设置 · 心跳 · 代理</h3>
 
-                <!-- ── 默认群号 ── -->
-                <div class="config-subsection">
-                    <h4>📢 默认群号</h4>
-                    <div class="setting-row">
-                        <span class="setting-label">默认群号</span>
-                        <input type="text" class="form-input" id="settingDefaultGroup" placeholder="如 333966713" style="max-width:180px">
-                    </div>
-                    <small style="color:var(--text-muted);font-size:11px">替代 config.json 的 DEFAULT_GROUP_CODE，点击「💾 保存设置」后生效。</small>
-                </div>
 
                 <!-- ── 服务端口 ── -->
                 <div class="config-subsection">
@@ -483,7 +494,7 @@
 
                 <!-- ── 代理模式 ── -->
                 <div class="config-subsection">
-                    <h4>🔁 代理模式（双模式 v3.5）</h4>
+                    <h4>🔁 代理模式</h4>
                     <p style="font-size:12px;color:var(--text-muted);margin-bottom:10px;line-height:1.5">
                         📌 <strong>@元宝模式</strong>：源群消息 → 转发到中转群@元宝 → 等回复 → 回原群<br>
                         ⚡ <strong>直转模式</strong>（关闭@元宝）：源群消息 → 直接转发到中转群，不等回复，实时完成
@@ -535,39 +546,6 @@
             </div>
 
             <div class="settings-section">
-                <h3>🌊 液态玻璃效果</h3>
-                <div class="setting-row setting-toggle" style="margin-top:6px">
-                    <span class="setting-label">🌊 液态玻璃效果（总开关）</span>
-                    <label class="toggle"><input type="checkbox" id="lgEnabled" onchange="onLgEnabled(this.checked)"><span class="slider"></span></label>
-                </div>
-                    <div class="setting-row setting-toggle">
-                        <span class="setting-label">🧲 物理引擎动态（感应器/鼠标）</span>
-                        <label class="toggle"><input type="checkbox" id="lgPhysics" onchange="onLgPhysics(this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-row setting-toggle">
-                        <span class="setting-label">🔍 折射（真实位移）</span>
-                        <label class="toggle"><input type="checkbox" id="lgRefraction" onchange="onLgRefraction(this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-row setting-toggle">
-                        <span class="setting-label">💡 动态光影（高光/边缘光）</span>
-                        <label class="toggle"><input type="checkbox" id="lgLighting" onchange="onLgLighting(this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-row setting-toggle">
-                        <span class="setting-label">⚡ 性能兼容模式（防卡死）</span>
-                        <label class="toggle"><input type="checkbox" id="lgPerf" onchange="onLgPerf(this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-row setting-toggle">
-                        <span class="setting-label">🚀 性能极致模式（折射光彩 + 液态玻璃真流动）</span>
-                        <label class="toggle"><input type="checkbox" id="lgExtreme" onchange="onLgExtreme(this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="action-row" style="margin-top:8px">
-                        <button class="btn btn-outline btn-small" onclick="requestLgSensors()">📡 启用设备感应器权限</button>
-                        <span id="lgSensorStatus" style="font-size:11px;color:var(--text-muted)"></span>
-                    </div>
-                    <div id="lgExtremeStatus" style="font-size:11px;margin-top:6px;display:none"></div>
-            </div>
-
-            <div class="settings-section">
                 <h3>📒 消息记录</h3>
                 <div class="setting-row setting-toggle" style="margin-bottom:10px">
                     <span class="setting-label">🔴 启用本地记录</span>
@@ -603,6 +581,7 @@
                 <div class="action-row" style="margin-top:10px">
                     <button class="btn btn-outline btn-small" onclick="checkHeartbeat()">检测心跳</button>
                     <button class="btn btn-outline btn-small" onclick="getForwardModeConfig()">桥接状态</button>
+                    <button class="btn btn-danger btn-small" onclick="clearMessages()">🗑️ 清空消息</button>
                 </div>
             </div>
 
@@ -631,6 +610,8 @@
 
             <button class="btn btn-primary btn-block" onclick="saveSettings()">💾 保存设置</button>
             </div>
+                </div>
+            </div>
         </div>
 
         <!-- 贴纸面板 -->
@@ -654,6 +635,39 @@
      7. 去重状态轮询
      8. LaTeX 模式移除（后端不支持）
      ═══════════════════════════════════════════ -->
+
+<!-- ── 私聊窗口（双击成员弹出） ── -->
+<div class="modal-overlay" id="dmModal" onclick="if(event.target===this)closeDmModal()">
+    <div class="modal-box dm-modal-box">
+        <div class="modal-header">
+            <span class="modal-title">✉️ 私聊：<span id="dmTargetNick" class="dm-target-nick"></span></span>
+            <button class="modal-close" onclick="closeDmModal()">&times;</button>
+        </div>
+        <div class="dm-history" id="dmHistory"><div class="empty-state">加载历史消息...</div></div>
+        <div class="form-group">
+            <label class="form-label">消息内容</label>
+            <textarea class="form-input" id="dmMessage" rows="3" placeholder="输入要私聊发送的消息..."></textarea>
+        </div>
+        <!-- ← 补：私聊高级选项（与普通模式一致：刷屏次数 + 间隔），标题行常显可点击展开 -->
+        <div class="settings-section" id="dmAdvOptions" style="margin-bottom:12px">
+            <h3 class="adv-toggle" onclick="toggleDmAdvOptions()" title="点击展开/折叠">⚙️ 高级选项 <span id="dmAdvCaret" style="float:right">▸</span></h3>
+            <div id="dmAdvOptionsBody" style="display:none">
+                <div class="setting-row" style="margin-top:12px">
+                    <span class="setting-label">刷屏次数</span>
+                    <input type="number" class="form-input" id="dmAdvCount" value="1" min="1" style="max-width:120px">
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">间隔(秒)</span>
+                    <input type="number" class="form-input" id="dmAdvInterval" value="0.5" min="0.05" step="0.1" style="max-width:120px">
+                </div>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-outline" onclick="closeDmModal()">取消</button>
+            <button class="btn btn-primary" onclick="sendDmMessage()">📤 发送私聊</button>
+        </div>
+    </div>
+</div>
 
 <!-- ── 回复模态框 ── -->
 <div class="modal-overlay" id="replyModal" onclick="if(event.target===this)closeReplyModal()">
@@ -689,6 +703,24 @@
         <div class="modal-actions">
             <button class="btn btn-outline" onclick="closeReplyModal()">取消</button>
             <button class="btn btn-primary" onclick="sendModalReply()">发送回复</button>
+        </div>
+    </div>
+</div>
+
+<!-- 消息历史记录弹窗 -->
+<div class="modal-overlay" id="historyModal" onclick="if(event.target===this)closeHistoryModal()">
+    <div class="modal-box history-modal-box">
+        <div class="modal-header">
+            <span class="modal-title">🕐 群聊消息历史记录</span>
+            <button class="modal-close" onclick="closeHistoryModal()">&times;</button>
+        </div>
+        <div class="history-toolbar">
+            <div class="form-group" style="flex:1;margin-bottom:0">
+                <input type="text" class="form-input" id="historySearch" placeholder="🔍 搜索历史消息..." oninput="filterHistoryDebounced()">
+            </div>
+        </div>
+        <div id="historyList" class="message-log history-list">
+            <div class="empty-state">加载中...</div>
         </div>
     </div>
 </div>
@@ -824,49 +856,10 @@
 
 <!-- 铭牌编辑器（V4.6 恢复：点击成员 → 🪪 设置 → 自定义昵称 + 铭牌钻标） -->
 
-<!-- ════ V4.3 新功能模块：视频背景 / 图片编辑器 / @ 艾特 / 后端化设置 ════ -->
+<!-- ════ V4.3 新功能模块：图片编辑器 / @ 艾特 / 后端化设置 ════ -->
 
-<!-- ── 全场景液态玻璃：真实折射 SVG 滤镜（V4.5）── -->
-<svg width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true">
-  <defs>
-    <filter id="lg-refract" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency="0.009 0.013" numOctaves="2" seed="11" result="noise"/>
-      <feGaussianBlur in="noise" stdDeviation="0.5" result="soft"/>
-      <!-- RGB 三通道色散（厚透镜边缘色差，参考 YanAndFish/liquid-glass） -->
-      <feDisplacementMap id="lgDispMap" in="SourceGraphic" in2="soft" scale="26" xChannelSelector="R" yChannelSelector="G" result="dispR"/>
-      <feColorMatrix in="dispR" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="redChan"/>
-      <feDisplacementMap in="SourceGraphic" in2="soft" scale="22" xChannelSelector="R" yChannelSelector="G" result="dispG"/>
-      <feColorMatrix in="dispG" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="greenChan"/>
-      <feDisplacementMap in="SourceGraphic" in2="soft" scale="18" xChannelSelector="R" yChannelSelector="G" result="dispB"/>
-      <feColorMatrix in="dispB" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="blueChan"/>
-      <feBlend in="greenChan" in2="blueChan" mode="screen" result="gbChan"/>
-      <feBlend in="redChan" in2="gbChan" mode="screen" result="rgbChan"/>
-      <!-- 对齐 alpha，避免边缘黑边/撕裂 -->
-      <feComposite in="rgbChan" in2="SourceGraphic" operator="atop" result="fixedAlpha"/>
-      <feGaussianBlur in="fixedAlpha" stdDeviation="0.35"/>
-    </filter>
-    <!-- 🚀 性能极致模式：液态玻璃真流动（湍流 baseFrequency 持续动画 → 玻璃表面真实流动） -->
-    <filter id="lg-refract-flow" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency="0.010 0.016" numOctaves="2" seed="7" result="noise">
-        <animate attributeName="baseFrequency" dur="16s"
-                 values="0.010 0.016;0.016 0.010;0.009 0.018;0.012 0.013;0.010 0.016"
-                 repeatCount="indefinite"/>
-      </feTurbulence>
-      <feGaussianBlur in="noise" stdDeviation="0.4" result="soft"/>
-      <!-- RGB 三通道色散（流动模式，参考 YanAndFish/liquid-glass） -->
-      <feDisplacementMap in="SourceGraphic" in2="soft" scale="44" xChannelSelector="R" yChannelSelector="G" result="dispR"/>
-      <feColorMatrix in="dispR" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="redChan"/>
-      <feDisplacementMap in="SourceGraphic" in2="soft" scale="37" xChannelSelector="R" yChannelSelector="G" result="dispG"/>
-      <feColorMatrix in="dispG" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="greenChan"/>
-      <feDisplacementMap in="SourceGraphic" in2="soft" scale="30" xChannelSelector="R" yChannelSelector="G" result="dispB"/>
-      <feColorMatrix in="dispB" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="blueChan"/>
-      <feBlend in="greenChan" in2="blueChan" mode="screen" result="gbChan"/>
-      <feBlend in="redChan" in2="gbChan" mode="screen" result="rgbChan"/>
-      <feComposite in="rgbChan" in2="SourceGraphic" operator="atop" result="fixedAlpha"/>
-      <feGaussianBlur in="fixedAlpha" stdDeviation="0.3"/>
-    </filter>
-  </defs>
-</svg>
+<!-- 左下角固定设置按钮 -->
+<button id="fixedSettingsBtn" class="fixed-settings-btn" title="设置" onclick="toggleSettings()">⚙️</button>
 
     <script src="app.js"></script>
 </body>

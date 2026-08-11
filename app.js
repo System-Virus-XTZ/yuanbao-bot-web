@@ -1,7 +1,41 @@
 'use strict';
 
-// ── 按钮鼠标跟随光晕 ──
-document.addEventListener('mousemove',e=>{const t=e.target.closest('.btn');if(!t)return;const r=t.getBoundingClientRect();t.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');t.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%')});
+// ── 兼容性 polyfill：老浏览器（Safari <10 等）不支持 NodeList.forEach ──
+if (window.NodeList && !NodeList.prototype.forEach) {
+    NodeList.prototype.forEach = function (cb, thisArg) {
+        for (let i = 0; i < this.length; i++) cb.call(thisArg, this[i], i, this);
+    };
+}
+// ── 兼容性 polyfill：Element.closest（Safari <9 / IE）──
+if (window.Element && !Element.prototype.closest) {
+    Element.prototype.closest = function (sel) {
+        let el = this;
+        while (el && el.nodeType === 1) {
+            if (el.matches(sel)) return el;
+            el = el.parentElement || el.parentNode;
+        }
+        return null;
+    };
+}
+// ── 兼容性 polyfill：Element.matches ──
+if (window.Element && !Element.prototype.matches) {
+    Element.prototype.matches = Element.prototype.msMatchesSelector ||
+        Element.prototype.webkitMatchesSelector ||
+        function (sel) { return [].indexOf.call(document.querySelectorAll(sel), this) !== -1; };
+}
+
+// ── 兼容性：安全 localStorage 访问 ──
+// ← 修复：Safari 隐私模式 / 部分系统禁用存储时，直接访问 localStorage 会抛
+//   SecurityError 导致整个脚本崩溃。以下包装统一 try/catch 静默降级。
+function safeGet(key) {
+    try { return window.localStorage.getItem(key); } catch (e) { return null; }
+}
+function safeSet(key, value) {
+    try { window.localStorage.setItem(key, value); } catch (e) { /* 隐私模式等静默失败 */ }
+}
+function safeRemove(key) {
+    try { window.localStorage.removeItem(key); } catch (e) { /* 静默失败 */ }
+}
 
 // ── 全局状态 ──
 const state = {
@@ -13,26 +47,22 @@ const state = {
     groupNameCache: {},  // { group_code: group_name } 群名缓存
     groupOwnerUserId: '',
     currentGroup: '',
+    membersGroup: '',    // 当前 state.members 所属的群号（用于切换群后不误显示旧群成员）
     botId: '',           // ← 修复：从 status API 读取
     forwardMode: false,
     msgLogEnabled: true,
     recallMonitorEnabled: false,
-    theme: localStorage.getItem('theme') || 'light',
-    glassEnabled: localStorage.getItem('glassEnabled') !== '0',  // 液态玻璃默认开启（增强）
-    frostEnabled: localStorage.getItem('frostEnabled') === '1',    // 毛玻璃默认关闭（V4.2 修复）
-    effectEnabled: localStorage.getItem('effectEnabled') === '1',  // 界面效果总开关默认关闭
+    theme: safeGet('theme') || 'light',
     selectedSticker: null,
     statusPollingStarted: false,  // ← 修复：防止重复轮询
-    backgroundMode: localStorage.getItem('bgMode') || 'colorful',  // colorful | glass | custom
-    customBg: localStorage.getItem('customBg') || '',            // 自定义背景 Data URL
-    bgDim: localStorage.getItem('bgDim') === '1',
-    theme_qq: localStorage.getItem('themeQQ') || 'default',
-    effect: localStorage.getItem('phoneEffect') || '',  // V4.2 手机厂商效果（替代液态玻璃）
-    customTheme: JSON.parse(localStorage.getItem('customTheme') || 'null'),
-    techMode: localStorage.getItem('techMode') === '1',          // 大公司科技感模式
-    memberBadges: JSON.parse(localStorage.getItem('memberBadges') || '{}'),  // {user_id: {text, type, color, auth, avatar}}
-    memberAuth: JSON.parse(localStorage.getItem('memberAuth') || '{}'),  // {user_id: true} 认证蓝标
-    memberAvatars: JSON.parse(localStorage.getItem('memberAvatars') || '{}'),  // {user_id: dataURL} 自定义头像
+    backgroundMode: safeGet('bgMode') || 'colorful',  // colorful | glass | custom
+    customBg: safeGet('customBg') || '',            // 自定义背景 Data URL
+    bgDim: safeGet('bgDim') === '1',
+    theme_qq: safeGet('themeQQ') || 'default',
+    customTheme: JSON.parse(safeGet('customTheme') || 'null'),
+    memberBadges: JSON.parse(safeGet('memberBadges') || '{}'),  // {user_id: {text, type, color, auth, avatar}}
+    memberAuth: JSON.parse(safeGet('memberAuth') || '{}'),  // {user_id: true} 认证蓝标
+    memberAvatars: JSON.parse(safeGet('memberAvatars') || '{}'),  // {user_id: dataURL} 自定义头像
 };
 
 // ── 工具函数 ──
@@ -57,15 +87,33 @@ function createToastContainer() {
 // 统一：用 r.ok 判断成功，避免字段名错误
 async function api(path, opts = {}) {
     try {
-        const res = await fetch(path, {
-            headers: { 'Content-Type': 'application/json' },
-            ...opts,
-            body: opts.body ? JSON.stringify(opts.body) : undefined,
-        });
-        const j = await res.json();
-        return j;
+        // ← 修复：POST 请求统一注入当前查看的群号（发送到当前派而非默认群），
+        //   显式传了 group_code 的请求（如 groups/switch、groups/listen）不受影响
+        const body = opts.body ? { ...opts.body } : undefined;
+        if (body && typeof body === 'object' && !('group_code' in body) && state.currentGroup) {
+            body.group_code = state.currentGroup;
+        }
+        // ← 修复：请求超时保护（15s）。后端异常/无响应时 fetch 不会自行结束，
+        //   发送按钮/消息列表会一直"转圈"，表现为界面卡死。超时后返回失败并提示。
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), (opts.timeout || 15) * 1000);
+        try {
+            const res = await fetch(path, {
+                headers: { 'Content-Type': 'application/json' },
+                ...opts,
+                signal: ctrl.signal,
+                body: body ? JSON.stringify(body) : undefined,
+            });
+            clearTimeout(timer);
+            const j = await res.json();
+            return j;
+        } catch (e) {
+            clearTimeout(timer);
+            console.error(`[API] ${path} 请求失败:`, e);
+            return { ok: false, message: e.name === 'AbortError' ? '请求超时，请检查服务器连接' : e.message };
+        }
     } catch (e) {
-        console.error(`[API] ${path} 请求失败:`, e);
+        console.error(`[API] ${path} 调用异常:`, e);
         return { ok: false, message: e.message };
     }
 }
@@ -78,55 +126,11 @@ function toggleTheme() {
 document.documentElement.setAttribute('data-theme', state.theme);
 if (state.theme === 'dark') $('themeToggle').textContent = '🌙';
 
-// ── 液态玻璃开关（V4.2 修复：默认关闭） ──
-function toggleGlass(enabled) {
-    state.glassEnabled = enabled;
-    localStorage.setItem('glassEnabled', enabled ? '1' : '0');
-    const cb = $('settingGlassEffect');
-    if (cb) cb.checked = enabled;
-    if (enabled) {
-        document.documentElement.classList.remove('no-glass');
-    } else {
-        document.documentElement.classList.add('no-glass');
-    }
-    // 与全场景液态玻璃总开关联动（合并后的单一总开关）
-    if (typeof LG !== 'undefined') {
-        LG.setEnabled(enabled);
-        localStorage.setItem('lgEnabled', enabled ? '1' : '0');
-    }
-}
-
-// ── 毛玻璃效果开关（V4.2 新增：默认关闭） ──
-function toggleFrost(enabled) {
-    state.frostEnabled = enabled;
-    localStorage.setItem('frostEnabled', enabled ? '1' : '0');
-    const cb = $('settingFrostEffect');
-    if (cb) cb.checked = enabled;
-    if (enabled) {
-        document.documentElement.classList.remove('no-frost');
-    } else {
-        document.documentElement.classList.add('no-frost');
-    }
-}
-
-// ── 界面效果总开关（V4.2 新增：默认关闭） ──
-function toggleEffectEnabled(enabled) {
-    state.effectEnabled = enabled;
-    localStorage.setItem('effectEnabled', enabled ? '1' : '0');
-    const cb = $('settingEffectEnabled');
-    if (cb) cb.checked = enabled;
-    if (enabled) {
-        document.documentElement.classList.remove('no-effect');
-    } else {
-        document.documentElement.classList.add('no-effect');
-    }
-}
-
 // ── 黑夜模式（V4.2 修复：与厂商效果完全兼容） ──
 function setDarkMode(enabled) {
     state.theme = enabled ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', state.theme);
-    localStorage.setItem('theme', state.theme);
+    safeSet('theme', state.theme);
     const cb = $('settingDarkMode');
     if (cb) cb.checked = enabled;
     const tg = $('themeToggle');
@@ -160,23 +164,23 @@ function applyBackground() {
 
 function setBackgroundMode(mode) {
     state.backgroundMode = mode;
-    localStorage.setItem('bgMode', mode);
+    safeSet('bgMode', mode);
     if (mode !== 'custom') {
         // 切换走自定义时保留已存图片，方便切回
-        state.customBg = localStorage.getItem('customBg') || '';
+        state.customBg = safeGet('customBg') || '';
     }
     applyBackground();
 }
 
 function toggleBgDim(enabled) {
     state.bgDim = enabled;
-    localStorage.setItem('bgDim', enabled ? '1' : '0');
+    safeSet('bgDim', enabled ? '1' : '0');
     applyBackground();
 }
 
 function clearCustomBg() {
     state.customBg = '';
-    localStorage.removeItem('customBg');
+    safeRemove('customBg');
     applyBackground();
     showToast('已清除自定义背景', 'success');
 }
@@ -221,62 +225,11 @@ function handleCustomBgSelect(e) {
     resizeImageToDataURL(file, (dataUrl) => {
         if (!dataUrl) return;
         state.customBg = dataUrl;
-        localStorage.setItem('customBg', dataUrl);
+        safeSet('customBg', dataUrl);
         state.backgroundMode = 'custom';
-        localStorage.setItem('bgMode', 'custom');
+        safeSet('bgMode', 'custom');
         applyBackground();
         showToast('自定义背景已应用', 'success');
-    });
-}
-
-// ── V4.2 各手机厂商 UI 效果系统（替代液态玻璃）──
-const PHONE_EFFECTS = [
-    { id: 'ios',       name: '🍎 iOS 18',     swatch: 'linear-gradient(135deg,#007AFF,#5AC8FA)' },
-    { id: 'harmony',   name: '🌸 鸿蒙 HarmonyOS', swatch: 'linear-gradient(135deg,#FF6B6B,#FFB088)' },
-    { id: 'harmony-spatial', name: '🌌 鸿蒙空间光感', swatch: 'linear-gradient(135deg,#2B9DFA,#7DD8FF)' },
-    { id: 'hyperos',   name: '🟠 HyperOS 小米', swatch: 'linear-gradient(135deg,#FF6700,#FF9F1A)' },
-    { id: 'coloros',   name: '💚 ColorOS OPPO', swatch: 'linear-gradient(135deg,#1A8C5E,#3DCCA6)' },
-    { id: 'origin',    name: '🔵 OriginOS vivo', swatch: 'linear-gradient(135deg,#4158D0,#0093E9)' },
-    { id: 'oneui',     name: '🌌 OneUI 三星', swatch: 'linear-gradient(135deg,#1428A0,#5B6CE5)' },
-    { id: 'flyme',     name: '🪶 Flyme 魅族', swatch: 'linear-gradient(135deg,#00B0F0,#00D8C8)' },
-    { id: 'oxygen',    name: '🔴 OxygenOS 一加', swatch: 'linear-gradient(135deg,#EB0028,#FF4444)' },
-    { id: 'magic',     name: '💜 MagicOS 荣耀', swatch: 'linear-gradient(135deg,#7B61FF,#A78BFA)' },
-    { id: 'material',  name: '🤖 Material You', swatch: 'linear-gradient(135deg,#6750A4,#D0BCFF)' },
-];
-function renderEffectGrid() {
-    const grid = $('effectGrid');
-    if (!grid) return;
-    grid.innerHTML = PHONE_EFFECTS.map(e => `
-        <button class="theme-chip ${state.effect === e.id ? 'active' : ''}" data-effect-id="${e.id}" onclick="setPhoneEffect('${e.id}')">
-            <span class="theme-swatch" style="background:${e.swatch}"></span>
-            <span>${e.name}</span>
-        </button>
-    `).join('');
-}
-function setPhoneEffect(effectId) {
-    state.effect = effectId;
-    localStorage.setItem('phoneEffect', effectId);
-    // V4.2 修复：选择效果时自动开启总开关
-    if (effectId && !state.effectEnabled) {
-        state.effectEnabled = true;
-        localStorage.setItem('effectEnabled', '1');
-        const cb = $('settingEffectEnabled');
-        if (cb) cb.checked = true;
-        document.documentElement.classList.remove('no-effect');
-    }
-    applyPhoneEffect();
-    flashThemeSwitch();
-    showToast(`已切换为 ${PHONE_EFFECTS.find(e=>e.id===effectId)?.name || '原生'} 效果`, 'success');
-}
-function applyPhoneEffect() {
-    const html = document.documentElement;
-    PHONE_EFFECTS.forEach(e => html.classList.remove('effect-' + e.id));
-    // V4.2 修复：总开关关闭时不应用任何厂商效果
-    if (state.effectEnabled && state.effect) {
-        html.classList.add('effect-' + state.effect);
-    }
-    document.querySelectorAll('#effectGrid .theme-chip').forEach(c => {
-        c.classList.toggle('active', c.dataset.effectId === state.effect && state.effectEnabled);
     });
 }
 
@@ -315,10 +268,10 @@ function renderThemeGrid() {
         <div id="customGradientPanel" style="display:${state.theme_qq === 'qq-custom-gradient' ? 'block' : 'none'};margin-top:10px;padding:12px;background:var(--input-bg);border-radius:12px;border:1px solid var(--border-soft)">
             <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">🎨 自定义渐变主题（V4.2）— 选任意两色做为主色，支持任意颜色组合</div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>主色 A</span><input type="color" id="customFrom" value="${state.customTheme?.from || CUSTOM_THEME_DEFAULTS.from}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>主色 B</span><input type="color" id="customTo" value="${state.customTheme?.to || CUSTOM_THEME_DEFAULTS.to}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>背景 A</span><input type="color" id="customBgFrom" value="${state.customTheme?.bgFrom || CUSTOM_THEME_DEFAULTS.bgFrom}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>背景 B</span><input type="color" id="customBgTo" value="${state.customTheme?.bgTo || CUSTOM_THEME_DEFAULTS.bgTo}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>主色 A</span><input type="color" id="customFrom" value="${(state.customTheme || {}).from || CUSTOM_THEME_DEFAULTS.from}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>主色 B</span><input type="color" id="customTo" value="${(state.customTheme || {}).to || CUSTOM_THEME_DEFAULTS.to}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>背景 A</span><input type="color" id="customBgFrom" value="${(state.customTheme || {}).bgFrom || CUSTOM_THEME_DEFAULTS.bgFrom}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px"><span>背景 B</span><input type="color" id="customBgTo" value="${(state.customTheme || {}).bgTo || CUSTOM_THEME_DEFAULTS.bgTo}" onchange="onCustomThemeChange()" style="width:36px;height:28px;border:1px solid var(--border-soft);border-radius:4px;background:none"></label>
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap" id="customPresets">
                 <button class="theme-chip" onclick="applyCustomPreset('#FF0080','#7928CA','#FFF0F8','#FFFFFF')" style="font-size:11px">🌸 粉紫</button>
@@ -336,7 +289,7 @@ function renderThemeGrid() {
 }
 function applyCustomPreset(a, b, bgA, bgB) {
     state.customTheme = { from: a, to: b, bgFrom: bgA, bgTo: bgB };
-    localStorage.setItem('customTheme', JSON.stringify(state.customTheme));
+    safeSet('customTheme', JSON.stringify(state.customTheme));
     const set = (id, v) => { const el = $(id); if (el) el.value = v; };
     set('customFrom', a); set('customTo', b); set('customBgFrom', bgA); set('customBgTo', bgB);
     if (state.theme_qq !== 'qq-custom-gradient') setQQTheme('qq-custom-gradient');
@@ -349,7 +302,7 @@ function onCustomThemeChange() {
         bgFrom: $('customBgFrom').value,
         bgTo: $('customBgTo').value,
     };
-    localStorage.setItem('customTheme', JSON.stringify(state.customTheme));
+    safeSet('customTheme', JSON.stringify(state.customTheme));
     applyCustomGradientVars();
     updateCustomGradientPreview();
 }
@@ -387,10 +340,7 @@ function shade(hex, amt) {
     return '#' + [f(r), f(g), f(b)].map(v => v.toString(16).padStart(2, '0')).join('');
 }
 function flashThemeSwitch() {
-    const h = document.documentElement;
-    h.classList.add('theme-switching');
-    clearTimeout(h.__tsTimer);
-    h.__tsTimer = setTimeout(() => h.classList.remove('theme-switching'), 480);
+    // 主题切换闪烁特效已移除（保留空函数以兼容调用点）
 }
 function hexLuminance(hex) {
     const m = hex.replace('#','').match(/.{1,2}/g);
@@ -408,7 +358,7 @@ function updateCustomGradientPreview() {
 function setQQTheme(themeId) {
     if (!QQ_THEMES.find(t => t.id === themeId)) return;
     state.theme_qq = themeId;
-    localStorage.setItem('themeQQ', themeId);
+    safeSet('themeQQ', themeId);
     applyQQTheme();
     flashThemeSwitch();
     if (themeId === 'qq-custom-gradient') applyCustomGradientVars();
@@ -435,38 +385,25 @@ function applyQQTheme() {
     });
 }
 
-/* 鸿蒙空间光感：点击坐标生成灵动粒子爆发 */
-function spawnHarmonyParticles(clientX, clientY){
-    const count = 8 + Math.floor(Math.random() * 5);
-    const frag = document.createDocumentFragment();
-    for (let i = 0; i < count; i++){
-        const p = document.createElement('span');
-        p.className = 'harmony-particle';
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 20 + Math.random() * 36;
-        p.style.left = clientX + 'px';
-        p.style.top = clientY + 'px';
-        p.style.setProperty('--tx', Math.cos(angle) * dist + 'px');
-        p.style.setProperty('--ty', Math.sin(angle) * dist + 'px');
-        frag.appendChild(p);
-        setTimeout(() => { if (p.parentNode) p.parentNode.removeChild(p); }, 720);
-    }
-    document.body.appendChild(frag);
-}
-function initHarmonySpatialInteractions(){
-    document.addEventListener('click', (e) => {
-        if (!document.documentElement.classList.contains('theme-qq-harmony-spatial')) return;
-        const t = e.target.closest('.btn, .chip, .theme-chip, .toggle .slider, input[type="range"], .sticker-item, .tab-item');
-        if (!t) return;
-        spawnHarmonyParticles(e.clientX, e.clientY);
-    });
-}
-
 // ── Tab 切换 ──
 // 右上角"⋯"在 设置 ↔ 消息 之间切换（侧边栏已删除，作为唯一入口）
 function toggleSettings() {
-    const active = document.querySelector('.tab-page.active');
-    switchTab(active && active.id === 'tab-settings' ? 'tab-messages' : 'tab-settings');
+    const m = $('settingsModal');
+    if (!m) return;
+    if (m.classList.contains('active')) closeSettingsModal();
+    else openSettingsModal();
+}
+function openSettingsModal() {
+    const m = $('settingsModal');
+    if (!m) return;
+    m.classList.add('active');
+    // 进入设置时加载插件列表
+    if (typeof loadPlugins === 'function') loadPlugins();
+    refreshBadgeStats();
+}
+function closeSettingsModal() {
+    const m = $('settingsModal');
+    if (m) m.classList.remove('active');
 }
 function switchTab(tabId) {
     document.querySelectorAll('.tab-page').forEach(p => p.classList.remove('active'));
@@ -479,18 +416,73 @@ function switchTab(tabId) {
         // 消息页三栏：默认加载群聊与成员
         loadGroups();
         switchPanel('group-members');
-    }
-    if (tabId === 'tab-messages' || tabId === 'tab-settings') {
         refreshBadgeStats();
-        const cb = $('settingTechMode');
-        if (cb) cb.checked = state.techMode;
-    }
-    if (tabId === 'tab-settings') {
-        // 插件生态已合并到设置页：进入设置时加载插件列表
-        if (typeof loadPlugins === 'function') loadPlugins();
     }
     updateTabIndicator(tabId);
 }
+
+// ── 左右栏折叠/恢复 ──
+// side: 'groups' | 'members'
+function toggleColumn(side) {
+    const layout = document.querySelector('.messages-layout');
+    if (!layout) return;
+    // 手机端（单栏模式）：切换「仅显示该栏」视图（竖条常显，由 CSS 控制）
+    if (window.innerWidth <= 1180) {
+        if (side === 'messages') {
+            // 手机端：折叠/展开消息栏（收起后仅剩三竖条）
+            layout.classList.remove('show-groups', 'show-members');
+            layout.classList.toggle('collapsed-messages');
+            return;
+        }
+        const active = layout.classList.contains('show-' + side);
+        layout.classList.remove('show-groups', 'show-members');
+        if (!active) layout.classList.add('show-' + side);
+        return;
+    }
+    // 桌面端：折叠/展开对应栏
+    layout.classList.toggle('collapsed-' + side);
+}
+function restoreColumn(side) {
+    const layout = document.querySelector('.messages-layout');
+    if (!layout) return;
+    // 手机端：恢复后只显示该栏（竖条常显，由 CSS 控制）
+    if (window.innerWidth <= 1180) {
+        // 消息栏：回到消息视图（同时撤销折叠）
+        if (side === 'messages') {
+            layout.classList.remove('show-groups', 'show-members', 'collapsed-messages');
+            return;
+        }
+        layout.classList.remove('show-groups', 'show-members', 'collapsed-messages');
+        layout.classList.add('show-' + side);
+        return;
+    }
+    // 桌面端：展开对应栏
+    layout.classList.remove('collapsed-' + side);
+}
+// 手机端：从左右栏全屏视图返回消息视图（← 返回按钮）
+function closeSidePanels() {
+    const layout = document.querySelector('.messages-layout');
+    if (!layout) return;
+    layout.classList.remove('show-groups', 'show-members');
+    // 手机端返回时同时撤销消息栏折叠，保证消息栏可见
+    if (window.innerWidth <= 1180) layout.classList.remove('collapsed-messages');
+}
+// 窗口尺寸变化时：切回消息栏视图（手机端恢复时只显示单栏，转桌面后重置）
+let _prevDesktopView = window.innerWidth > 1180;
+window.addEventListener('resize', () => {
+    const layout = document.querySelector('.messages-layout');
+    if (!layout) return;
+    const isDesktop = window.innerWidth > 1180;
+    if (isDesktop) {
+        layout.classList.remove('show-groups', 'show-members');
+    } else if (_prevDesktopView) {
+        // 桌面 → 手机：默认显示「元宝派」（群聊列表），并撤销消息栏折叠恢复主体
+        layout.classList.remove('show-members');
+        layout.classList.remove('collapsed-messages');
+        layout.classList.add('show-groups');
+    }
+    _prevDesktopView = isDesktop;
+});
 
 // ── 子面板切换（tab-members / tab-settings 内的面板切换） ──
 function switchSubPanel(tabId, subpanelId) {
@@ -506,7 +498,7 @@ function switchSubPanel(tabId, subpanelId) {
     });
 }
 
-// ── Tab 指示器位置更新（跑道形液态玻璃滑块，支持横屏垂直模式） ──
+// ── Tab 指示器位置更新（跑道形滑块，支持横屏垂直模式） ──
 function updateTabIndicator(tabId) {
     const indicator = document.getElementById('tabIndicator');
     const activeTab = document.querySelector(`.tab-item[data-tab="${tabId}"]`);
@@ -540,7 +532,14 @@ function updateTabIndicator(tabId) {
 }
 
 // ── 页面加载 & 窗口resize 时更新指示器位置 ──
-document.addEventListener('DOMContentLoaded', () => updateTabIndicator('tab-messages'));
+document.addEventListener('DOMContentLoaded', () => {
+    updateTabIndicator('tab-messages');
+    // 手机版默认显示「元宝派」（群聊列表）而非消息栏
+    if (window.innerWidth <= 1180) {
+        const layout = document.querySelector('.messages-layout');
+        if (layout) { layout.classList.remove('show-members', 'collapsed-messages'); layout.classList.add('show-groups'); }
+    }
+});
 window.addEventListener('resize', () => {
     const active = document.querySelector('.tab-item.active');
     if (active) updateTabIndicator(active.dataset.tab);
@@ -563,6 +562,12 @@ async function connect() {
     const r = await api('/api/connect', { method: 'POST' });
     if (r.ok) {
         state.connected = true;
+        // ← 修复：连接后立即获取 bot_id，避免等 3 秒轮询才有值，
+        //   否则刚发送的消息（isSelf 判断依赖 botId）不会标记为自己的
+        try {
+            const st = await api('/api/status');
+            if (st && st.bot_id) state.botId = st.bot_id;
+        } catch (e) {}
         updateConnectionUI();
         showToast('已连接', 'success');
         startStatusPolling();
@@ -623,8 +628,9 @@ function startStatusPolling() {
 
 // ── 消息显示 ──
 async function loadRecentMessages() {
-    const limit = $('msgLimit').value;
-    // ← 修复：按当前监听群请求，后端只返回该群消息，避免混入其他群历史消息
+    const limit = 500;
+    // ← 修复：按当前查看的群过滤，避免不同群（派）的消息混合显示；
+    //   未选择群时后端兜底返回所有监听群消息
     const g = state.currentGroup;
     const r = await api(`/api/messages?limit=${limit}${g ? '&group_code=' + encodeURIComponent(g) : ''}`);
     if (r && r.messages) {
@@ -635,6 +641,16 @@ async function loadRecentMessages() {
         state.messages = r.messages;
         renderMessages();
     }
+}
+// ← 修复：图片 URL 转后端代理。resourceUrl（hunyuan.tencent.com/api/resource/download?resourceId=...）
+//   需 X-Token 鉴权，浏览器 <img> 无法带该头 → 404。通过 /api/image-proxy 后端带 token 拉取。
+function proxyImageUrl(u) {
+    if (!u) return u;
+    if (u.indexOf('hunyuan.tencent.com/api/resource/') >= 0) {
+        const m = u.match(/resourceId=([^&]+)/);
+        if (m) return '/api/image-proxy?resourceId=' + encodeURIComponent(m[1]);
+    }
+    return u;  // COS 直链或签名 URL 直接用
 }
 function renderMessages() {
     const container = $('messageLog');
@@ -650,15 +666,43 @@ function renderMessages() {
         newKeys.push(key);
         const isSelf = m.sender_id === state.botId;
         let contentHtml = '';
-        if (m.media_info && m.media_info.type === 'image' && m.media_info.image_urls && m.media_info.image_urls.length) {
+        const mi = m.media_info;
+        if (mi && mi.type === 'image' && mi.image_urls && mi.image_urls.length) {
+            // 图片消息：渲染缩略图（可点击查看原图）
             const extra = (m.content && m.content !== '[图片]') ? `<div>${escHtml(m.content)}</div>` : '';
-            const imgs = m.media_info.image_urls.map(u =>
-                `<img src="${u}" class="msg-image" alt="[图片]" referrerpolicy="no-referrer" onclick="event.stopPropagation()">`
-            ).join('');
+            // ← 修复：resourceUrl（hunyuan.tencent.com/api/resource/download）需 X-Token 鉴权，
+            //   浏览器直接访问 404。改走后端代理 /api/image-proxy?resourceId=... 显示
+            const imgs = mi.image_urls.map(u => {
+                const proxySrc = proxyImageUrl(u);
+                return `<img src="${proxySrc}" class="msg-image" alt="[图片]" referrerpolicy="no-referrer" onclick="event.stopPropagation();window.open('${escHtml(u)}','_blank')">`;
+            }).join('');
             contentHtml = extra + `<div class="msg-images">${imgs}</div>`;
+        } else if (mi && mi.type === 'sticker') {
+            // 贴纸消息：优先用本地 ico 图标（按名称对应）
+            const sname = mi.sticker_name || '';
+            const extra = (m.content && m.content !== '[贴纸]') ? `<div>${escHtml(m.content)}</div>` : '';
+            // ← 修改：仅使用本地 ico 图标，未匹配显示"缺图"错误占位，不再回退旧 CDN
+            const imgSrc = stickerIconMap[sname] || '';
+            contentHtml = extra +
+                (imgSrc
+                    ? `<img src="${imgSrc}" class="msg-sticker" alt="${escHtml(sname || '贴纸')}" title="${escHtml(sname || '贴纸')}" referrerpolicy="no-referrer" loading="lazy" onerror="this.outerHTML='<span class=&quot;msg-sticker-fallback&quot;>❌</span>'">`
+                    : `<span class="msg-sticker-fallback" title="缺少本地图标">❌</span>`) +
+                (sname ? `<span class="msg-media-name">${escHtml(sname)}</span>` : '');
+        } else if (mi && mi.type === 'file') {
+            // 文件消息：显示文件名 + 下载链接
+            const fname = mi.file_name || '文件';
+            const fsize = mi.file_size ? fmtSize(mi.file_size) : '';
+            const fhref = mi.file_url || '#';
+            contentHtml = `<div class="msg-file"><a href="${escHtml(fhref)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">` +
+                `<span class="msg-file-icon">📎</span><span class="msg-file-name">${escHtml(fname)}${fsize ? ` <small>(${fsize})</small>` : ''}</span></a></div>`;
+        } else if (mi && mi.type === 'video') {
+            // 视频消息：显示视频名称（可点开 URL）
+            const vname = mi.name || '视频';
+            const vhref = mi.url || '#';
+            contentHtml = `<div class="msg-file"><a href="${escHtml(vhref)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">` +
+                `<span class="msg-file-icon">🎬</span><span class="msg-file-name">${escHtml(vname)}</span></a></div>`;
         } else {
-            const tag = m.media_info ? (m.media_info.type === 'sticker' ? ' 😀' : m.media_info.type === 'file' ? ' 📎' : '') : '';
-            contentHtml = escHtml(m.content || '') + tag;
+            contentHtml = escHtml(m.content || '');
         }
         const quoteHtml = m.quote ? `<div class="msg-quote"><span class="quote-sender">${escHtml(m.quote.sender_nickname || m.quote.sender_id || '?')}</span><span class="quote-text">${escHtml(m.quote.desc || '')}</span></div>` : '';
         if (existing.has(key)) {
@@ -687,17 +731,26 @@ function renderMessages() {
     });
     // 移除不再存在的旧节点
     for (const [, el] of existing) el.remove();
-    container.replaceChildren(frag);
+    // ← 修复：replaceChildren 为 Chrome 86+ / Safari 14+，老浏览器需降级
+    if (container.replaceChildren) {
+        container.replaceChildren(frag);
+    } else {
+        container.innerHTML = '';
+        container.appendChild(frag);
+    }
 }
 function escHtml(s) {
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
 }
-function filterMessages() {
-    const q = $('searchMessage').value.toLowerCase();
-    const items = document.querySelectorAll('.message-entry');
-    items.forEach(el => { el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none'; });
+// 文件大小格式化（对齐前端展示习惯：B/KB/MB/GB）
+function fmtSize(bytes) {
+    if (!bytes || bytes <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let v = bytes, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
 }
 async function clearMessages() {
     // ← 修复：同时清空后端缓存并重新加载，避免清空后自动刷新又把旧消息拉回来
@@ -708,27 +761,141 @@ async function clearMessages() {
     loadRecentMessages();
 }
 
-// ── 自动刷新 (消息 2 秒 / 元宝派+成员 5 秒) ──
-let autoRefreshTimer = null;
-let panelRefreshTimer = null;
-function toggleAutoRefresh() {
-    const checked = $('autoRefreshToggle').checked;
-    if (checked) {
-        autoRefreshTimer = setInterval(() => loadRecentMessages(), 2000);
-        // 元宝派（群列表）与成员：5 秒刷新一次，避免群名查询/成员列表请求过于频繁
-        panelRefreshTimer = setInterval(() => {
-            loadGroups();
-            loadMembers();
-        }, 5000);
+// ── 消息历史记录弹窗 ──
+let _historyMessages = [];
+function toggleHistoryModal() {
+    const m = $('historyModal');
+    if (!m) return;
+    if (m.classList.contains('active')) closeHistoryModal();
+    else openHistoryModal();
+}
+// 历史弹窗自动刷新定时器（打开时每 5 秒刷新，关闭时停止）
+let historyRefreshTimer = null;
+function openHistoryModal() {
+    const m = $('historyModal');
+    if (!m) return;
+    m.classList.add('active');
+    const search = $('historySearch');
+    if (search) search.value = '';
+    loadHistory();
+    // ← 自动刷新：历史弹窗打开期间每 5 秒刷新一次
+    if (historyRefreshTimer) clearInterval(historyRefreshTimer);
+    historyRefreshTimer = setInterval(() => {
+        // 仅在弹窗打开且用户未在搜索时刷新
+        if (!m.classList.contains('active')) return;
+        const q = $('historySearch');
+        if (q && q.value.trim()) return;
+        loadHistory();
+    }, 5000);
+}
+function closeHistoryModal() {
+    const m = $('historyModal');
+    if (m) m.classList.remove('active');
+    if (historyRefreshTimer) { clearInterval(historyRefreshTimer); historyRefreshTimer = null; }
+}
+// ── 当前派信息弹窗（右上角 ⋯ 按钮） ──
+function toggleGroupInfoModal() {
+    const m = $('groupInfoModal');
+    if (!m) return;
+    if (m.classList.contains('active')) closeGroupInfoModal();
+    else openGroupInfoModal();
+}
+function openGroupInfoModal() {
+    const m = $('groupInfoModal');
+    if (!m) return;
+    // 填充当前派信息
+    const code = state.currentGroup || '';
+    const name = state.groupNameCache[code] || '';
+    // Bot 昵称：优先从成员列表找，其次后端记录的"元宝"
+    let botName = '元宝';
+    if (state.botId) {
+        const bot = (state.members || []).find(x => x.user_id === state.botId);
+        if (bot && bot.nick_name) botName = bot.nick_name;
+    }
+    const memberCount = (state.members || []).length;
+    const setName = $('ginfoName'), setCode = $('ginfoCode'),
+          setBot = $('ginfoBotName'), setCount = $('ginfoMemberCount');
+    if (setName) setName.textContent = name || '(未知)';
+    if (setCode) setCode.textContent = code || '(未选择)';
+    if (setBot) setBot.textContent = botName;
+    if (setCount) setCount.textContent = memberCount ? String(memberCount) : '-';
+    m.classList.add('active');
+}
+function closeGroupInfoModal() {
+    const m = $('groupInfoModal');
+    if (m) m.classList.remove('active');
+}
+
+async function loadHistory() {
+    const list = $('historyList');
+    if (!list) return;
+    list.innerHTML = '<div class="empty-state">加载中...</div>';
+    // ← 修复：按当前查看的群过滤历史消息，避免跨群混合
+    const g = state.currentGroup;
+    const r = await api(`/api/messages?limit=500${g ? '&group_code=' + encodeURIComponent(g) : ''}`);
+    if (r && r.messages) {
+        _historyMessages = r.messages;
+        renderHistory();
     } else {
-        if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-        if (panelRefreshTimer) { clearInterval(panelRefreshTimer); panelRefreshTimer = null; }
+        list.innerHTML = '<div class="empty-state">历史消息加载失败</div>';
     }
 }
-// 页面加载后立即启动自动刷新
+function renderHistory() {
+    const list = $('historyList');
+    if (!list) return;
+    const q = ($('historySearch') ? $('historySearch').value.trim() : '').toLowerCase();
+    let msgs = _historyMessages;
+    if (q) {
+        msgs = msgs.filter(m => {
+            const hay = ((m.sender_name || '') + ' ' + (m.sender_id || '') + ' ' + (m.content || '') + ' ' + (m.time || '')).toLowerCase();
+            return hay.includes(q);
+        });
+    }
+    if (!msgs.length) {
+        list.innerHTML = '<div class="empty-state">' + (q ? '未找到匹配消息' : '暂无历史消息') + '</div>';
+        return;
+    }
+    // 按时间正序展示（旧 → 新），最新在底部
+    const frag = document.createDocumentFragment();
+    msgs.forEach(m => {
+        const el = document.createElement('div');
+        el.className = 'message-entry ' + (m.sender_id === state.botId ? 'self' : 'other');
+        let contentHtml = '';
+        if (m.media_info && m.media_info.type === 'image' && m.media_info.image_urls && m.media_info.image_urls.length) {
+            contentHtml = `<span class="history-media-tag">[图片]</span>`;
+        } else {
+            contentHtml = escHtml(m.content || '');
+        }
+        el.innerHTML = `<div class="msg-meta"><span class="msg-sender">${escHtml(m.sender_name || m.sender_id || '?')}</span><span class="msg-time">${escHtml(m.time || '')}</span></div><div>${contentHtml}</div>`;
+        frag.appendChild(el);
+    });
+    list.replaceChildren ? list.replaceChildren(frag) : (list.innerHTML = '', list.appendChild(frag));
+}
+function filterHistoryDebounced() {
+    // 防抖搜索
+    clearTimeout(_historySearchTimer);
+    _historySearchTimer = setTimeout(renderHistory, 200);
+}
+let _historySearchTimer = null;
+
+// ── 自动刷新（默认开启）：消息 2 秒 / 元宝派+成员 5 秒 ──
+// 开关已从前端移除，自动刷新始终开启
+let autoRefreshTimer = null;
+let panelRefreshTimer = null;
+function startAutoRefresh() {
+    // 先清理旧定时器再创建，避免重复初始化导致定时器累积
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+    if (panelRefreshTimer) { clearInterval(panelRefreshTimer); panelRefreshTimer = null; }
+    autoRefreshTimer = setInterval(() => loadRecentMessages(), 2000);
+    // 元宝派（群列表）与成员：5 秒刷新一次，避免群名查询/成员列表请求过于频繁
+    panelRefreshTimer = setInterval(() => {
+        loadGroups();
+        loadMembers();
+    }, 5000);
+}
+// 页面加载后立即启动自动刷新（默认开启）
 document.addEventListener('DOMContentLoaded', () => {
-    // autoRefreshToggle 默认是 checked，手动触发生效
-    setTimeout(() => toggleAutoRefresh(), 500);
+    setTimeout(startAutoRefresh, 500);
 });
 
 // ── V4.2 展开式聊天编辑器 ──
@@ -741,41 +908,24 @@ function setComposerMode(mode) {
     document.querySelectorAll('#composerModeChips .chip').forEach(c => {
         c.classList.toggle('active', c.dataset.mode === mode);
     });
-    const needsTarget = ['at', 'atspam', 'dm', 'dmspam', 'latex', 'latex-spam'].includes(mode);
+    const needsTarget = ['latex'].includes(mode);
     $('composerTargetRow').style.display = needsTarget ? 'block' : 'none';
-    $('composerCountRow').style.display = ['spam', 'atspam', 'dmspam', 'latex-spam'].includes(mode) ? 'block' : 'none';
-    $('composerLatexControls').style.display = ['latex', 'latex-spam'].includes(mode) ? 'block' : 'none';
+    $('composerCountRow').style.display = 'none';
+    $('composerLatexControls').style.display = ['latex'].includes(mode) ? 'block' : 'none';
 }
 async function sendFromComposer() {
     const text = $('composerText').value.trim();
     if (!text) { showToast('请输入消息内容', 'warning'); return; }
     const body = { text, mode: _composerMode };
-    if (['at', 'atspam'].includes(_composerMode)) {
-        // at 模式：后端 /api/send 读取 at_user / at_nickname
-        body.at_user = $('composerTargetId').value.trim();
-        body.at_nickname = $('composerTargetNick').value.trim();
-    } else if (_composerMode === 'multi-at') {
-        // 批量 @：多个用户ID以逗号/空格/换行分隔
-        const ids = $('composerTargetId').value.split(/[,，\s]+/).filter(Boolean);
-        const nicks = $('composerTargetNick').value.split(/[,，\s]+/).filter(Boolean);
-        const users = ids.map((id, i) => ({ user_id: id, nickname: nicks[i] || '' }));
-        body.users = users;
-    } else if (['dm', 'dmspam'].includes(_composerMode)) {
-        body.target_id = $('composerTargetId').value.trim();
-        body.target_nick = $('composerTargetNick').value.trim();
-    } else if (['latex', 'latex-spam'].includes(_composerMode)) {
+    if (['latex'].includes(_composerMode)) {
         body.target_id = $('composerTargetId').value.trim();
         body.target_nick = $('composerTargetNick').value.trim();
     }
-    if (['spam', 'atspam', 'dmspam', 'latex-spam'].includes(_composerMode)) {
-        body.count = parseInt($('composerCount').value) || 5;
-        body.interval = parseFloat($('composerInterval').value) || 0.1;
-    }
-    if (['latex', 'latex-spam'].includes(_composerMode)) {
+    if (['latex'].includes(_composerMode)) {
         body.scale = parseFloat($('composerScaleSlider').value) || 3.0;
         body.rotate = parseInt($('composerRotateSlider').value) || 15;
     }
-    const endpoint = (_composerMode === 'multi-at') ? '/api/send-multi-at' : '/api/send';
+    const endpoint = '/api/send';
     const r = await api(endpoint, { method: 'POST', body });
     if (r && r.ok) {
         $('composerText').value = '';
@@ -787,8 +937,387 @@ async function sendFromComposer() {
     }
 }
 
+// ── 输入框 @ 候选选择器（普通模式）──
+let _atSuggestIdx = -1;
+let _atSuggestPaused = false;  // 选中昵称后暂停候选框，直到用户重新编辑（输入/删除字符）才恢复
+let _atPausedValue = '';       // 暂停时的输入框文本快照（文本变化则自动恢复候选框）
+
+// 获取光标前最近一个「@开头」的 token：返回 { atPos, query } 或 null
+// @ 前可以是开头、空白或任意字符（中文/标点均可）
+function atTokenAt(value, caret) {
+    const before = value.slice(0, caret);
+    // 从末尾往前找最后一个 @，且 @ 后紧跟非空白的待选词
+    let pos = before.lastIndexOf('@');
+    while (pos >= 0) {
+        const head = before[pos + 1] || '';
+        if (head !== ' ' && head !== '　' && head !== '\n' && head !== '\t') {
+            // ← 修复：从 @ 位置开始匹配，query 取 @ 后到空白/冒号前的已输入字符，
+            //   不能截掉 @ 后的字符（旧代码 slice(0,pos+1) 导致 query 永远为空，候选框从不按输入过滤）
+            const m = before.slice(pos).match(/^@([^\s@:：]*)$/);
+            if (m) return { atPos: pos, query: m[1] };
+        }
+        pos = before.lastIndexOf('@', pos - 1);
+    }
+    return null;
+}
+
+function updateAtSuggest() {
+    const box = $('atSuggestBox');
+    const input = $('inputMessage');
+    if (!box || !input || currentMode !== 'normal') { if (box) box.style.display = 'none'; return; }
+    // ← 修复：选中昵称后暂停候选框，直到用户重新编辑。
+    //   否则含空格昵称（@德 道哥）选中后候选框又会弹出、拦截 Enter，导致无法输入/换行。
+    //   兜底：文本发生变化（IME 组词等可能不触发 keydown）则自动恢复
+    if (_atSuggestPaused) {
+        if (input.value !== _atPausedValue) _atSuggestPaused = false;
+        else { box.style.display = 'none'; return; }
+    }
+    const tok = atTokenAt(input.value, input.selectionStart);
+    if (!tok) { box.style.display = 'none'; return; }
+    const q = (tok.query || '').toLowerCase();
+    // ← 修复：@ 后已是完整成员昵称（如刚选中的 @德道哥 或用户手输完整名）时
+    //   不再弹出候选框 —— 否则候选框持续开着，按 Enter 被拦截为"选中候选"，
+    //   导致 @ 之后无法换行。只有部分输入（还在筛选）或刚输入 @（待选）才弹出。
+    if (q && (state.members || []).some(m =>
+        (m.nick_name || '').toLowerCase() === q || (m.user_id || '').toLowerCase() === q)) {
+        box.style.display = 'none';
+        return;
+    }
+    let users = (state.members || []).filter(m =>
+        !q || (m.nick_name || '').toLowerCase().includes(q) || (m.user_id || '').toLowerCase().includes(q));
+    if (!users.length) { box.style.display = 'none'; return; }
+    // ← 修复：不再截断，显示所有匹配的派成员（列表自身可滚动）
+    box.innerHTML = users.map((u, i) =>
+        `<div class="at-suggest-item${i === 0 ? ' active' : ''}" onmousedown="pickAtSuggest(event, ${i})">`
+        + `<span class="at-suggest-nick" title="@${escapeHtml(u.nick_name || '')}">@${escapeHtml(u.nick_name || '(无名)')}</span>`
+        + `<span class="at-suggest-id">${escapeHtml(u.user_id)}</span></div>`).join('');
+    _atSuggestIdx = 0;
+    box.style.display = 'block';
+    positionAtSuggest();
+}
+
+// 候选框用 fixed 定位（对齐输入框，DOM 已挂到 body 下，无祖先裁剪）。
+// 按视口剩余空间动态调整高度与朝向，保证列表完整显示、永不出界。
+function positionAtSuggest() {
+    const box = $('atSuggestBox');
+    const input = $('inputMessage');
+    if (!box || !input || box.style.display === 'none') return;
+    const r = input.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const MAX_H = Math.min(box.scrollHeight, 210);
+    // 上方空间：输入框顶到视口顶部；下方空间：输入框底到视口底部
+    const upSpace = r.top - 8;
+    const downSpace = vh - r.bottom - 8;
+    box.style.position = 'fixed';
+    box.style.left = Math.max(8, r.left) + 'px';
+    // 宽度取输入框宽度，但不超过视口宽度（避免贴左边界后右侧出屏）
+    box.style.width = Math.min(r.width, window.innerWidth - Math.max(8, r.left) - 8) + 'px';
+    let top, h;
+    if (upSpace >= downSpace && upSpace > 60) {
+        // 上方空间更多：向上弹，高度不超过上方空间
+        h = Math.min(MAX_H, upSpace);
+        top = r.top - h - 6;
+    } else if (downSpace > 60) {
+        // 下方空间更多：向下弹，高度不超过下方空间
+        h = Math.min(MAX_H, downSpace);
+        top = r.bottom + 6;
+    } else {
+        // 上下都紧张：取最大可用空间，从输入框处居中弹出
+        h = Math.min(MAX_H, Math.max(upSpace, downSpace, 60));
+        top = Math.max(8, r.top - h - 6);
+    }
+    box.style.top = top + 'px';
+    box.style.maxHeight = h + 'px';
+    box.style.height = 'auto';
+}
+
+function setAtSuggestActive(idx) {
+    const box = $('atSuggestBox');
+    if (!box) return;
+    const items = box.querySelectorAll('.at-suggest-item');
+    if (!items.length) return;
+    idx = ((idx % items.length) + items.length) % items.length;
+    items.forEach((it, i) => it.classList.toggle('active', i === idx));
+    _atSuggestIdx = idx;
+    const act = items[idx];
+    if (!act) return;
+    // ← 修复：scrollIntoView 会触发 window scroll 事件，进而再次触发 positionAtSuggest，
+    //   可能引发「滚动→重定位→再滚动」循环导致页面卡死。
+    //   改为仅调整候选框自身滚动容器的 scrollTop，不冒泡到窗口，从根上消除循环。
+    const boxRect = box.getBoundingClientRect();
+    const itemRect = act.getBoundingClientRect();
+    if (itemRect.top < boxRect.top) box.scrollTop += itemRect.top - boxRect.top - 4;
+    else if (itemRect.bottom > boxRect.bottom) box.scrollTop += itemRect.bottom - boxRect.bottom + 4;
+}
+
+// 选中候选：把 @已输入 替换为 @昵称，光标置于其后（不加空格，可直接输入 :自定义名）
+function pickAtSuggest(e, idx) {
+    if (e) e.preventDefault();
+    const box = $('atSuggestBox');
+    if (!box) return;
+    const items = box.querySelectorAll('.at-suggest-item');
+    const item = items[idx] || items[_atSuggestIdx] || items[0];
+    if (!item) return;
+    const nick = item.querySelector('.at-suggest-nick').textContent.replace(/^@/, '');
+    const input = $('inputMessage');
+    const caret = input.selectionStart;
+    const before = input.value.slice(0, caret);
+    const after = input.value.slice(caret);
+    const tok = atTokenAt(input.value, caret);
+    const replace = tok ? before.slice(0, tok.atPos) + '@' + nick : before + '@' + nick;
+    // 仅当后面紧贴非空白内容时才补一个空格分隔（保持「@昵称 内容」语义）
+    const gap = after && !/^\s/.test(after) ? ' ' : '';
+    input.value = replace + gap + after;
+    const pos = replace.length + gap.length;
+    input.focus();
+    input.setSelectionRange(pos, pos);
+    box.style.display = 'none';
+    // ← 修复：选中后暂停候选框（含空格昵称 @德 道哥 也不会再弹出、拦截输入/Enter），
+    //   直到用户重新编辑（keydown 恢复 + 文本变化兜底）
+    _atSuggestPaused = true;
+    _atPausedValue = input.value;
+}
+
+// @ 候选框事件绑定
+(function initAtSuggest() {
+    const input = $('inputMessage');
+    if (!input) return;
+    input.addEventListener('input', () => {
+        autoResizeTextarea(input);  // ← 输入内容变化时自动增高
+        if (currentMode !== 'normal') { const b = $('atSuggestBox'); if (b) b.style.display = 'none'; return; }
+        // 暂停期间：文本变化（用户编辑）→ 恢复候选框；文本未变 → 保持暂停
+        if (_atSuggestPaused) {
+            if (input.value !== _atPausedValue) { _atSuggestPaused = false; updateAtSuggest(); return; }
+            const b = $('atSuggestBox'); if (b) b.style.display = 'none'; return;
+        }
+        updateAtSuggest();
+    });
+    input.addEventListener('click', () => { if (currentMode === 'normal') updateAtSuggest(); });
+    // ← 修复：移除 window scroll 捕获监听，避免候选框重定位触发滚动→重定位循环。
+    //   仅窗口 resize 时重新定位（输入框位置变化）；输入框位置随发送面板滚动而变时，
+    //   候选框在每次 input/click 事件时都会重新定位，无需监听滚动。
+    window.addEventListener('resize', positionAtSuggest);
+    // ← 修复：候选框移到 body 下，彻底脱离发送面板的 overflow/裁剪上下文，
+    //   保证任何情况下列表完整显示
+    const box = $('atSuggestBox');
+    if (box && box.parentNode !== document.body) document.body.appendChild(box);
+    // ← 补：贴纸小窗也挂到 body 下，避免被发送面板 overflow 裁剪
+    const sp = $('stickerPopover');
+    if (sp && sp.parentNode !== document.body) document.body.appendChild(sp);
+    // 点击输入框/其他区域时关闭贴纸小窗
+    document.addEventListener('mousedown', (e) => {
+        const sp2 = $('stickerPopover');
+        const btn = document.querySelector('.quick-action-btn[title="发送贴纸"]');
+        if (sp2 && sp2.style.display === 'block' && !sp2.contains(e.target) && (!btn || !btn.contains(e.target))) {
+            sp2.style.display = 'none';
+        }
+    });
+    window.addEventListener('resize', positionStickerPopover);
+    input.addEventListener('keydown', (e) => {
+        const box = $('atSuggestBox');
+        const boxOpen = currentMode === 'normal' && box && box.style.display === 'block';
+        // ← 修复：用户重新编辑（输入字符/退格/粘贴）时恢复候选框，
+        //   但导航键（方向键/Enter/Escape）不恢复，保持选中后的暂停状态
+        if (_atSuggestPaused && currentMode === 'normal'
+            && !['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'Enter', 'Escape', 'Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) {
+            _atSuggestPaused = false;
+        }
+        // Backspace：光标紧贴 @昵称 后时一次删除整个 @昵称（含可选 :显示名）
+        if (currentMode === 'normal' && e.key === 'Backspace' && !e.ctrlKey && !e.metaKey) {
+            const selStart = input.selectionStart;
+            if (input.selectionEnd === selStart && selStart > 0) {
+                const before = input.value.slice(0, selStart);
+                // ← 修复：只匹配「光标紧邻」的 @昵称 / @昵称:显示名（昵称不跨空格），
+                //   且该昵称必须匹配派成员，才整体删除（避免误删 @ 后的正文）
+                const m = before.match(/(?:^|[^@\s])@([^\s@:：]+)(?::([^\s@]*))?$/);
+                if (m) {
+                    const nick = m[1];
+                    const known = (state.members || []).some(x => x.nick_name === nick || x.user_id === nick);
+                    if (known) {
+                        const atStart = before.lastIndexOf('@');
+                        e.preventDefault();
+                        input.value = before.slice(0, atStart) + input.value.slice(selStart);
+                        input.setSelectionRange(atStart, atStart);
+                        if (box) box.style.display = 'none';
+                        return;
+                    }
+                }
+            }
+        }
+        if (!boxOpen) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); setAtSuggestActive(_atSuggestIdx + 1); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); setAtSuggestActive(_atSuggestIdx - 1); }
+        else if (e.key === 'Enter') {
+            // ← 修复：Shift+Enter 始终换行（候选框打开时也可换行），普通 Enter 才选中候选
+            if (e.shiftKey) { box.style.display = 'none'; return; }
+            // ← 修复：候选框打开但还没输入任何昵称（刚输入 @）时，Enter 视为"放弃选择并换行"，
+            //   而不是选中第一个候选 —— 否则用户只想换行却总是被选中候选
+            const tok = atTokenAt(input.value, input.selectionStart);
+            if (!tok || !tok.query) {
+                box.style.display = 'none';
+                return;
+            }
+            e.preventDefault(); pickAtSuggest(null, _atSuggestIdx);
+        }
+        else if (e.key === 'Escape') { box.style.display = 'none'; }
+    });
+})();
+
+// 解析输入框中的 @昵称 / @昵称:显示名 → { parts, text, ats }
+// parts: 有序片段 [{type:'text',text}|{type:'at',user_id,display}]，保持 @ 原始位置
+function parseAtMessage(raw) {
+    const members = state.members || [];
+    const byNick = {}, byId = {};
+    members.forEach(m => {
+        if (m.nick_name) byNick[m.nick_name] = m;
+        if (m.user_id) byId[m.user_id] = m;
+    });
+    const parts = [];
+    const ats = [];
+    let cursor = 0; // 已消费的原文位置
+    let idx = 0;
+    while ((idx = raw.indexOf('@', idx)) >= 0) {
+        const na = raw.indexOf('@', idx + 1);
+        const nl = raw.indexOf('\n', idx + 1);
+        const stop = Math.min(na < 0 ? raw.length : na, nl < 0 ? raw.length : nl);
+        const seg = raw.slice(idx + 1, stop);
+        if (!seg) { idx = stop; continue; }
+        // 昵称区域：到「冒号(在空白前)」或「第一个空白」或段尾
+        const ci = seg.search(/[:：]/);
+        const ws = seg.search(/\s/);
+        const hasColon = ci >= 0 && (ws < 0 || ci < ws);
+        const nameEnd = hasColon ? ci : (ws < 0 ? seg.length : ws);
+        const words = seg.slice(0, nameEnd).split(/\s+/);
+        // 从长到短逐词扩展匹配（支持含空格昵称）
+        let member = null, cand = '';
+        for (let k = words.length; k >= 1; k--) {
+            const c = words.slice(0, k).join(' ');
+            if (byNick[c] || byId[c]) { member = byNick[c] || byId[c]; cand = c; break; }
+        }
+        if (!member) { idx = stop; continue; }
+        // 显示名：冒号后到空白（自定义昵称）
+        let display = '';
+        if (hasColon) {
+            const rest = seg.slice(ci + 1);
+            const rws = rest.search(/\s/);
+            display = (rws < 0 ? rest : rest.slice(0, rws)).trim();
+        }
+        // @ 片段结束位置（相对原文）
+        const tokenEnd = idx + 1 + cand.length + (hasColon ? (ci - cand.length) + 1 + display.length : 0);
+        // 保留 @ 前面的文本片段
+        if (idx > cursor) parts.push({ type: 'text', text: raw.slice(cursor, idx) });
+        parts.push({ type: 'at', user_id: member.user_id, display: display || member.nick_name || '' });
+        ats.push({ user_id: member.user_id, nick: member.nick_name || '', display: display || member.nick_name || '' });
+        cursor = tokenEnd;
+        idx = stop;
+    }
+    // 尾部剩余文本
+    if (cursor < raw.length) parts.push({ type: 'text', text: raw.slice(cursor) });
+    if (!parts.length) parts.push({ type: 'text', text: raw });
+    // text：拼接所有文本片段（去掉 @），供后端兜底/日志
+    const text = parts.filter(p => p.type === 'text').map(p => p.text).join('').replace(/\s+/g, ' ').trim();
+    return { parts, text, ats };
+}
+
+// 高级选项折叠（普通模式）
+function toggleAdvOptions() {
+    const body = $('advOptionsBody');
+    const caret = $('advCaret');
+    if (!body) return;
+    const open = body.style.display !== 'none';
+    body.style.display = open ? 'none' : 'block';
+    if (caret) caret.textContent = open ? '▸' : '▾';
+}
+
+// ← 补：私聊窗口高级选项折叠（与普通模式一致）
+function toggleDmAdvOptions() {
+    const body = $('dmAdvOptionsBody');
+    const caret = $('dmAdvCaret');
+    if (!body) return;
+    const open = body.style.display !== 'none';
+    body.style.display = open ? 'none' : 'block';
+    if (caret) caret.textContent = open ? '▸' : '▾';
+}
+
+// ── 待发送媒体队列（图片/文件/贴纸先入输入框，点发送才真正发送） ──
+let pendingMedia = [];  // {type:'image'|'file'|'sticker', file?, name, size?}
+
+// 贴纸小窗点击 → 入队 + 输入框占位
+function pickStickerToQueue(name) {
+    queuePendingMedia({ type: 'sticker', name });
+    const box = $('stickerPopover');
+    if (box) box.style.display = 'none';
+}
+
+// 加入待发送队列并在输入框显示占位文本
+function queuePendingMedia(item) {
+    pendingMedia.push(item);
+    const input = $('inputMessage');
+    if (input) {
+        const placeholder = item.type === 'sticker'
+            ? `[贴纸:${item.name}]`
+            : `[${item.type === 'image' ? '图片' : '文件'}:${item.name}]`;
+        // ← 修复：占位符单独一行，且末尾追加换行，保证最后一个占位符后也可换行
+        const sep = input.value && !input.value.endsWith('\n') ? '\n' : '';
+        input.value = (input.value || '') + sep + placeholder + '\n';
+        autoResizeTextarea(input);
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    }
+    showToast('已加入待发送，点击发送按钮发送', 'info');
+}
+
+// ← 补：textarea 自动增高（内容变化时自适应，无需手动拉伸）
+function autoResizeTextarea(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = (el.scrollHeight > 160 ? 160 : Math.max(80, el.scrollHeight)) + 'px';
+}
+
+// 按顺序发送指定媒体列表（支持刷屏：每轮都发送一遍全部媒体）
+async function sendMediaList(items) {
+    if (!items || !items.length) return true;
+    const curGroup = (typeof state !== 'undefined' && state.currentGroup) || '';
+    let allOk = true;
+    // ← 修复：媒体发送中给出进度反馈，避免上传大图时页面无响应误以为"发送有问题"
+    showToast(items.length > 1 ? `正在发送 ${items.length} 个媒体...` : `正在发送${items[0].type === 'image' ? '图片' : (items[0].type === 'file' ? '文件' : '贴纸')}...`, 'info', 8000);
+    for (const it of items) {
+        try {
+            if (it.type === 'sticker') {
+                // 后端 /api/send-sticker 读取 body["name"]
+                const r = await api('/api/send-sticker', { method: 'POST', body: { name: it.name, group: curGroup } });
+                if (!r || !r.ok) throw new Error((r && r.message) || '贴纸发送失败');
+            } else {
+                const fd = new FormData();
+                fd.append('file', it.file);
+                if (curGroup) fd.append('group', curGroup);
+                const res = await fetch(it.type === 'image' ? '/api/send-image' : '/api/send-file', { method: 'POST', body: fd });
+                const j = await res.json();
+                if (!j.ok) throw new Error(j.message || (it.type === 'image' ? '图片发送失败' : '文件发送失败'));
+            }
+        } catch (e) {
+            allOk = false;
+            showToast((e && e.message) || '媒体发送失败', 'error');
+        }
+    }
+    return allOk;
+}
+
+// ← 修复：带媒体刷屏。清空待发送队列并返回媒体项（供每轮刷屏使用）
+function takePendingMedia() {
+    const items = pendingMedia.slice();
+    pendingMedia = [];
+    return items;
+}
+
 // ── 发送消息 ──
 let currentMode = 'normal';
+
+// ← 修改：输入框左下角快捷按钮 → 直接弹出文件选择器（不展开媒体面板、不切换模式、不打断输入）
+function openQuickMedia(type) {
+    const el = type === 'image' ? $('imageFile') : $('documentFile');
+    if (el) { el.value = ''; el.click(); }  // 清空 value 确保重复选择同一文件也触发 change
+}
 function setMode(mode) {
     currentMode = mode;
     document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
@@ -796,8 +1325,7 @@ function setMode(mode) {
     if (chip) chip.classList.add('active');
     const isMedia = mode === 'media';
     const isSticker = mode === 'sticker';
-    const needsTarget = !isMedia && !isSticker && ['at', 'atspam', 'multi-at', 'dm', 'dmspam'].includes(mode);
-    const needsCount = !isMedia && !isSticker && ['spam', 'atspam', 'dmspam', 'latex-spam'].includes(mode);
+    // ← 修改：LaTeX 已移入普通模式高级选项，不再有独立 latex 模式
     // media 模式：显示图片/文件功能区；sticker 模式：显示贴纸区；均隐藏文本发送区
     const mediaCtl = $('mediaControls');
     if (mediaCtl) mediaCtl.style.display = isMedia ? 'block' : 'none';
@@ -805,74 +1333,111 @@ function setMode(mode) {
     if (stickerCtl) stickerCtl.style.display = isSticker ? 'block' : 'none';
     const sendText = $('sendTextArea');
     if (sendText) sendText.style.display = (isMedia || isSticker) ? 'none' : '';
-    $('targetRow').style.display = needsTarget ? '' : 'none';
-    $('countRow').style.display = needsCount ? '' : 'none';
-    // 艾特全体：仅在「@ 艾特」模式下显示
-    const atAllRow = $('atAllRow');
-    if (atAllRow) atAllRow.style.display = (mode === 'at') ? '' : 'none';
-    const latexCtl = $('latexControls');
-    if (latexCtl) latexCtl.style.display = (mode === 'latex' || mode === 'latex-spam') ? 'block' : 'none';
-    $('targetLabel').textContent = (mode === 'dm' || mode === 'dmspam') ? '目标用户ID' : '@ 目标用户ID';
-    $('targetHint').textContent = needsTarget ? '💡 可在「成员」面板点击用户快速填入' : '';
-    if (mode === 'latex' || mode === 'latex-spam') updateLatexPreview();
+    $('targetRow').style.display = 'none';
+    $('countRow').style.display = 'none';
+    $('targetLabel').textContent = '@ 目标用户ID';
+    $('targetHint').textContent = '';
+    // 普通模式显示「高级选项」（含刷屏 + LaTeX 编辑器）
+    const advOptions = $('advOptions');
+    if (advOptions) advOptions.style.display = (mode === 'normal') ? '' : 'none';
+    // 非普通模式关闭 @ 候选框
+    if (mode !== 'normal') { const sb = $('atSuggestBox'); if (sb) sb.style.display = 'none'; }
 }
 async function sendMessage() {
+    // ← 修复：发送中禁用发送按钮，防止重复点击造成连发/卡顿
+    if (_sending) return;
     const text = $('inputMessage').value.trim();
 
-    // LaTeX 模式：组合所有 LaTeX 片段作为发送内容
-    if (currentMode === 'latex' || currentMode === 'latex-spam') {
-        if (latexItems.length === 0) {
-            showToast('请先添加至少一个 LaTeX 片段到消息列表', 'warning');
-            return;
+    // 普通模式：解析 @ 候选、支持高级选项（刷屏次数 + LaTeX 编辑器 + 媒体）
+    if (currentMode === 'normal') {
+        _sending = true;
+        const sendBtn = document.querySelector('.quick-send-btn');
+        if (sendBtn) { sendBtn.disabled = true; sendBtn.style.opacity = '.5'; }
+        try {
+            return await doSendNormal(text);
+        } finally {
+            _sending = false;
+            if (sendBtn) { sendBtn.disabled = false; sendBtn.style.opacity = '1'; }
         }
-        const finalMessage = latexItems.map(it => it.code).join('\n');
-        const body = {
-            text: finalMessage,
-            mode: currentMode === 'latex-spam' ? 'spam' : 'normal',
-        };
-        if ($('countRow').style.display !== 'none') {
-            body.count = parseInt($('inputCount').value) || 5;
-            body.interval = parseFloat($('inputInterval').value) || 0.1;
-        }
-        const r = await api('/api/send', { method: 'POST', body });
-        if (r && r.ok) {
-            showToast(r.message || 'LaTeX 消息已发送', 'success');
-            if (currentMode === 'latex') clearLatexList();
-        } else {
-            showToast((r && r.message) || '发送失败', 'error');
-        }
-        return;
-    }
-
-    if (!text) { showToast('请输入消息内容', 'warning'); return; }
-    const body = { text, mode: currentMode };
-    let endpoint = '/api/send';
-    if ($('targetRow').style.display !== 'none') {
-        const uid = $('inputTargetId').value.trim();
-        body.target_id = uid;
-        if (currentMode === 'at' || currentMode === 'atspam') {
-            body.at_user = uid;
-            body.at_nickname = $('inputTargetNick').value.trim();
-        } else if (currentMode === 'multi-at') {
-            // 批量 @：多个用户ID以逗号/空格/换行分隔
-            const ids = uid.split(/[,，\s]+/).filter(Boolean);
-            const nicks = $('inputTargetNick').value.split(/[,，\s]+/).filter(Boolean);
-            body.users = ids.map((id, i) => ({ user_id: id, nickname: nicks[i] || '' }));
-            endpoint = '/api/send-multi-at';
-        }
-    }
-    if ($('countRow').style.display !== 'none') {
-        body.count = parseInt($('inputCount').value) || 1;
-        body.interval = parseFloat($('inputInterval').value) || 0.1;
-    }
-    const r = await api(endpoint, { method: 'POST', body });
-    if (r && r.ok) {
-        showToast('发送成功', 'success');
-        $('inputMessage').value = '';
-    } else {
-        showToast((r && r.message) || '发送失败', 'error');
     }
 }
+let _sending = false;
+
+// ← 抽出的普通模式发送主逻辑（便于发送中状态管理）
+async function doSendNormal(text) {
+        // 高级选项刷屏次数（展开才生效）
+        const advBody = $('advOptionsBody');
+        const spamOpen = advBody && advBody.style.display !== 'none';
+        let spamCount = 1, spamInterval = 0.5;
+        if (spamOpen) {
+            spamCount = parseInt($('advCount').value) || 1;
+            spamInterval = parseFloat($('advInterval').value) || 0.5;
+        }
+
+        // 媒体 + LaTeX 同时存在时，优先 LaTeX（与之前行为一致）
+        if (latexItems.length > 0) {
+            const finalMessage = latexItems.map(it => it.code).join('\n');
+            const body = { text: finalMessage, mode: 'normal' };
+            if (spamCount > 1) { body.count = spamCount; body.interval = spamInterval; }
+            const r = await api('/api/send', { method: 'POST', body });
+            if (r && r.ok) {
+                showToast('LaTeX 消息已发送', 'success');
+                clearLatexList();
+                loadRecentMessages();
+            } else {
+                showToast((r && r.message) || '发送失败', 'error');
+            }
+            return;
+        }
+
+        // 取出待发送媒体（清空队列）
+        const mediaItems = takePendingMedia();
+        // 过滤占位符后得到真实文本
+        // ← 修复：只使用过滤后的真实文本，不能回退到含占位符的原始 text，
+        //   否则只有媒体时会把 [贴纸:x] 等占位符当正文发送
+        const realText = text.split('\n').filter(line =>
+            !/^\[(?:图片|文件|贴纸):.*\]$/.test(line.trim())).join('\n').trim();
+        const parsed = parseAtMessage(realText);
+        const hasText = parsed.parts.some(p => p.type === 'text' && p.text.trim());
+
+        // 无媒体且无文本 → 提示
+        if (mediaItems.length === 0 && !hasText && parsed.ats.length === 0) {
+            showToast('请输入消息内容', 'warning');
+            return;
+        }
+
+        // ← 修复：媒体 + 文本一起刷屏。每轮 = 发一遍全部媒体 + 发一次文本
+        const rounds = Math.max(1, spamCount);
+        const sendTextBody = (() => {
+            const b = { text: parsed.text, mode: 'normal' };
+            if (parsed.ats.length > 0) b.parts = parsed.parts;
+            return b;
+        })();
+        let okAll = true;
+        for (let i = 0; i < rounds; i++) {
+            // 每轮先发媒体（图片/文件/贴纸）
+            if (mediaItems.length) {
+                if (!await sendMediaList(mediaItems)) okAll = false;
+            }
+            // 再发文本（无文本则跳过）
+            if (hasText || parsed.ats.length > 0) {
+                const r = await api('/api/send', { method: 'POST', body: sendTextBody });
+                if (!(r && r.ok)) okAll = false;
+            }
+            // 轮次间隔
+            if (i < rounds - 1 && spamCount > 1) {
+                await new Promise(res => setTimeout(res, spamInterval * 1000));
+            }
+        }
+        if (okAll) showToast(rounds > 1 ? `已发送 ${rounds} 轮` : '发送成功', 'success');
+        else showToast('部分发送失败', 'error');
+        $('inputMessage').value = '';
+        autoResizeTextarea($('inputMessage'));  // ← 发送后重置输入框高度
+        loadRecentMessages();
+        return;
+}
+
+// ── LaTeX 消息编辑器（v6.0：从旧版移植）──
 
 // ── LaTeX 消息编辑器（v6.0：从旧版移植）──
 let latexItems = [];
@@ -941,9 +1506,17 @@ function initLatexControls() {
 function addToLatexList() {
     const text = latexSettings.text;
     if (!text || !text.trim()) { showToast('请输入文本内容', 'warning'); return; }
-    latexItems.push({ text, code: generateLatexCode(), settings: { ...latexSettings } });
+    const code = generateLatexCode();
+    latexItems.push({ text, code, settings: { ...latexSettings } });
     $('latexListContainer').style.display = 'block';
     renderLatexList();
+    // ← 修复：把生成的 LaTeX 代码追加到普通消息内容框，用户可直接看到内容并发送
+    const input = $('inputMessage');
+    if (input) {
+        input.value = input.value ? input.value + '\n' + code : code;
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    }
     showToast('✅ 已添加到消息列表', 'success');
 }
 
@@ -989,23 +1562,93 @@ function clearLatexSettings() {
 
 // ── 贴纸 ──
 let stickerList = [];
+let stickerIconMap = {};  // ← 修改：贴纸名称 → 本地 ico URL（/api/sticker-icon?name=...）
 async function loadStickers() {
     const r = await api('/api/stickers');
     if (r && r.stickers) {
         stickerList = r.stickers;
+        // ← 修改：收集本地图标映射（名称对应），未匹配的贴纸明确报错（不再回退旧 CDN）
+        stickerIconMap = {};
+        const missing = [];
+        r.stickers.forEach(s => { if (s.icon) stickerIconMap[s.name] = s.icon; else missing.push(s.name); });
         renderStickers();
+        if (missing.length) {
+            const list = missing.slice(0, 8).join('、') + (missing.length > 8 ? ` 等共 ${missing.length} 个` : '');
+            showToast(`贴纸缺少本地图标：${list}`, 'error', 6000);
+        }
     }
+}
+// ── 贴纸图片 URL ─────────────────────────────
+// ← 修改：仅使用本地 ico 图标（按名称对应），未匹配返回空串由调用方显示"缺图"错误占位，
+//   不再回退旧 qzonestyle CDN
+function stickerImageUrl(s) {
+    if (s && s.icon) return s.icon;
+    return '';
 }
 function renderStickers() {
     const grid = $('stickerGrid');
     const q = ($('stickerSearch').value || '').toLowerCase();
     const items = stickerList.filter(s => !q || s.name.includes(q));
-    grid.innerHTML = items.map(s => `<div class="sticker-item ${state.selectedSticker === s.name ? 'selected' : ''}" onclick="selectSticker('${s.name}')" ondblclick="sendStickerByName('${s.name}')"><span class="sticker-emoji">😊</span>${s.name}</div>`).join('');
+    grid.innerHTML = items.map(s => {
+        const img = stickerImageUrl(s);
+        const sel = state.selectedSticker === s.name ? 'selected' : '';
+        return `<div class="sticker-item ${sel}" onclick="selectSticker('${s.name}')" ondblclick="sendStickerByName('${s.name}')" title="${s.name}${img ? '' : '（缺少本地图标）'}">` +
+            (img ? `<img class="sticker-emoji" src="${img}" alt="${s.name}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none';this.insertAdjacentHTML('afterend','<span class=&quot;sticker-emoji-fallback&quot;>❌</span>')">` : `<span class="sticker-emoji-fallback">❌</span>`) +
+            `<span class="sticker-name">${s.name}</span></div>`;
+    }).join('');
 }
+// ← 修改：输入框左下角贴纸快捷按钮 → 弹出贴纸选择小窗（仿 @ 候选框），
+//   点击贴纸直接发送并收起，不切换模式、不打断输入
+function openQuickSticker() {
+    const box = $('stickerPopover');
+    if (!box) return;
+    if (box.style.display === 'block') { box.style.display = 'none'; return; }
+    if (!stickerList.length) loadStickers();
+    // 渲染贴纸网格（点击 → 加入待发送队列，显示在输入框，不立即发送）
+    const items = (stickerList.length ? stickerList : [{ name: '（加载中...）' }]).slice(0, 40);
+    box.innerHTML = `<div class="sticker-pop-title">选择贴纸</div><div class="sticker-pop-grid">` + items.map(s => {
+        const img = stickerImageUrl(s);
+        return `<div class="sticker-pop-item" onclick="pickStickerToQueue('${s.name.replace(/'/g, "\\'")}')" title="${s.name}${img ? '' : '（缺少本地图标）'}">` +
+            (img ? `<img src="${img}" alt="${s.name}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none';this.insertAdjacentHTML('afterend','<span class=&quot;sticker-emoji-fallback&quot;>❌</span>')">` : `<span class="sticker-emoji-fallback">❌</span>`) +
+            `</div>`;
+    }).join('') + `</div>`;
+    box.style.display = 'block';
+    positionStickerPopover();
+}
+function positionStickerPopover() {
+    const box = $('stickerPopover');
+    const input = $('inputMessage');
+    if (!box || !input || box.style.display === 'none') return;
+    const r = input.getBoundingClientRect();
+    const vh = window.innerHeight;
+    box.style.position = 'fixed';
+    box.style.left = Math.max(8, r.left) + 'px';
+    box.style.width = '320px';
+    // 优先向上弹，空间不足向下
+    const idealH = Math.min(box.scrollHeight, 300);
+    const upSpace = r.top - 8;
+    const downSpace = vh - r.bottom - 8;
+    let top;
+    if (upSpace >= downSpace && upSpace > 80) top = r.top - idealH - 6;
+    else top = r.bottom + 6;
+    box.style.top = top + 'px';
+    box.style.maxHeight = Math.min(idealH, Math.max(upSpace, downSpace, 120)) + 'px';
+    box.style.overflowY = 'auto';
+}
+function hideStickerPopover() { const b = $('stickerPopover'); if (b) b.style.display = 'none'; }
+let _stickerFromQuick = false;
+
 function selectSticker(name) { state.selectedSticker = name; renderStickers(); }
 function sendStickerByName(name) {
     state.selectedSticker = name;
     renderStickers();
+    // ← 补：从贴纸小窗（😀快捷按钮）发送时，直接收起小窗（不经过贴纸面板）
+    const sp = $('stickerPopover');
+    if (sp && sp.style.display === 'block') {
+        sp.style.display = 'none';
+        sendSticker();
+        return;
+    }
     sendSticker();
 }
 function filterStickers() { renderStickers(); }
@@ -1022,18 +1665,42 @@ async function sendSticker() {
     body.interval = parseFloat($('stickerInterval').value) || 0.1;
     // ← 修复：路径 /api/send-sticker
     const r = await api('/api/send-sticker', { method: 'POST', body });
-    if (r && r.ok) { showToast('贴纸已发送', 'success'); }
+    if (r && r.ok) {
+        showToast('贴纸已发送', 'success');
+        loadRecentMessages();   // ← 立即刷新，显示自己刚发送的贴纸
+        // ← 补：从输入框快捷按钮打开时，发送后自动收起贴纸面板
+        if (_stickerFromQuick) {
+            _stickerFromQuick = false;
+            const ctl = $('stickerControls');
+            if (ctl) ctl.style.display = 'none';
+        }
+    }
     else { showToast((r && r.message) || '发送失败', 'error'); }
 }
 
 // ── 群成员 ──
 async function loadMembers() {
-    // ← 修复：返回 { ok, members: [...] }
-    const r = await api('/api/members');
+    // ← 修复：请求时带上当前查看的群，切换派后成员列表随群刷新
+    const g = state.currentGroup;
+    const r = await api(`/api/members${g ? '?group_code=' + encodeURIComponent(g) : ''}`);
     if (r && r.ok && r.members) {
-        state.members = r.members;
-        state.groupOwnerUserId = r.group_owner_user_id || '';
-        renderMembers();
+        if (r.members.length) {
+            state.members = r.members;
+            state.membersGroup = g || state.currentGroup || '';
+            state.groupOwnerUserId = r.group_owner_user_id || '';
+            // ← 显示成员人数（括号形式，如 (43)）
+            const badge = $('memberCountBadge');
+            if (badge) badge.textContent = `(${r.members.length})`;
+            renderMembers();
+        } else if (state.membersGroup !== (g || state.currentGroup)) {
+            // ← 修复：当前群无成员且与旧成员所属群不同（跨群/切换后），
+            //   显示空态而非错误保留上一个群的成员
+            state.members = [];
+            $('memberList').innerHTML = '<div class="empty-state">该群暂无成员数据</div>';
+            const badge = $('memberCountBadge');
+            if (badge) badge.textContent = '';
+        }
+        // 当前群已有旧成员但本次返回空（临时故障）：保留旧成员，候选框仍可用
     } else {
         $('memberList').innerHTML = `<div class="empty-state">${r.message || '获取失败或无权限'}</div>`;
     }
@@ -1063,7 +1730,7 @@ function openBadgeEditor(uid, nick) {
     _editingBadgeNick = (nick || (_mem && _mem.nick_name) || '(无名)');
     const existing = state.memberBadges[uid] || {};
     _currentBadgeType = existing.type || 'admin';
-    _currentBadgeText = existing.text || BADGE_PRESETS[_currentBadgeType]?.text || '成员';
+    _currentBadgeText = existing.text || (BADGE_PRESETS[_currentBadgeType] || {}).text || '成员';
     _currentAuth = state.memberAuth[uid] === true;
     _currentAvatar = state.memberAvatars[uid] || '';
     $('badgeTargetNick').textContent = _editingBadgeNick;
@@ -1117,7 +1784,8 @@ function updateBadgePreview() {
     const nick = ($('badgeNick').value || '').trim();
     const text = customText || _currentBadgeText;
     const type = _currentBadgeType;
-    const auth = $('badgeAuthToggle')?.checked || false;
+    const _authEl = $('badgeAuthToggle');
+    const auth = _authEl ? _authEl.checked : false;
     const authHtml = auth ? '<span class="auth-badge-vip">V</span>' : '';
     const showName = nick || _editingBadgeNick;
     $('badgePreview').innerHTML =
@@ -1130,17 +1798,18 @@ function saveBadge() {
     const nick = ($('badgeNick').value || '').trim();
     const text = customText || _currentBadgeText;
     const type = _currentBadgeType;
-    const auth = $('badgeAuthToggle')?.checked || false;
+    const _authEl = $('badgeAuthToggle');
+    const auth = _authEl ? _authEl.checked : false;
     state.memberBadges[_editingBadgeUid] = { text, type, nick, updated: Date.now() };
-    localStorage.setItem('memberBadges', JSON.stringify(state.memberBadges));
+    safeSet('memberBadges', JSON.stringify(state.memberBadges));
     state.memberAuth[_editingBadgeUid] = auth;
-    localStorage.setItem('memberAuth', JSON.stringify(state.memberAuth));
+    safeSet('memberAuth', JSON.stringify(state.memberAuth));
     if (_currentAvatar) {
         state.memberAvatars[_editingBadgeUid] = _currentAvatar;
-        localStorage.setItem('memberAvatars', JSON.stringify(state.memberAvatars));
+        safeSet('memberAvatars', JSON.stringify(state.memberAvatars));
     } else {
         delete state.memberAvatars[_editingBadgeUid];
-        localStorage.setItem('memberAvatars', JSON.stringify(state.memberAvatars));
+        safeSet('memberAvatars', JSON.stringify(state.memberAvatars));
     }
     const parts = [];
     if (nick) parts.push('昵称：' + nick);
@@ -1157,9 +1826,9 @@ function removeBadge() {
     delete state.memberBadges[_editingBadgeUid];
     delete state.memberAuth[_editingBadgeUid];
     delete state.memberAvatars[_editingBadgeUid];
-    localStorage.setItem('memberBadges', JSON.stringify(state.memberBadges));
-    localStorage.setItem('memberAuth', JSON.stringify(state.memberAuth));
-    localStorage.setItem('memberAvatars', JSON.stringify(state.memberAvatars));
+    safeSet('memberBadges', JSON.stringify(state.memberBadges));
+    safeSet('memberAuth', JSON.stringify(state.memberAuth));
+    safeSet('memberAvatars', JSON.stringify(state.memberAvatars));
     showToast(`已移除 ${_editingBadgeNick} 的所有自定义资料`, 'success');
     closeBadgeModal();
     renderMembers();
@@ -1170,9 +1839,9 @@ function clearAllBadges() {
     state.memberBadges = {};
     state.memberAuth = {};
     state.memberAvatars = {};
-    localStorage.setItem('memberBadges', '{}');
-    localStorage.setItem('memberAuth', '{}');
-    localStorage.setItem('memberAvatars', '{}');
+    safeSet('memberBadges', '{}');
+    safeSet('memberAuth', '{}');
+    safeSet('memberAvatars', '{}');
     showToast('已清空所有自定义资料', 'success');
     renderMembers();
     refreshBadgeStats();
@@ -1207,15 +1876,15 @@ function importMemberBadges() {
                 const data = JSON.parse(ev.target.result);
                 if (data.badges) {
                     state.memberBadges = data.badges;
-                    localStorage.setItem('memberBadges', JSON.stringify(state.memberBadges));
+                    safeSet('memberBadges', JSON.stringify(state.memberBadges));
                 }
                 if (data.auth) {
                     state.memberAuth = data.auth;
-                    localStorage.setItem('memberAuth', JSON.stringify(state.memberAuth));
+                    safeSet('memberAuth', JSON.stringify(state.memberAuth));
                 }
                 if (data.avatars) {
                     state.memberAvatars = data.avatars;
-                    localStorage.setItem('memberAvatars', JSON.stringify(state.memberAvatars));
+                    safeSet('memberAvatars', JSON.stringify(state.memberAvatars));
                 }
                 const total = Object.keys(state.memberBadges).length + Object.keys(state.memberAuth).length + Object.keys(state.memberAvatars).length;
                 showToast(`已导入（${total} 项数据）`, 'success');
@@ -1244,7 +1913,9 @@ function refreshBadgeStats() {
 
 function renderMembers() {
     const q = ($('memberSearch').value || '').toLowerCase();
-    const list = state.members.filter(m => !q || (m.nick_name || '').toLowerCase().includes(q) || (m.user_id || '').includes(q));
+    // ← 修复：过滤掉无 user_id 的成员（异常数据），保证每个成员项可双击私聊
+    const list = state.members.filter(m => (m.user_id || '').length > 0)
+        .filter(m => !q || (m.nick_name || '').toLowerCase().includes(q) || (m.user_id || '').includes(q));
     if (!list.length) { $('memberList').innerHTML = '<div class="empty-state">无成员</div>'; return; }
     $('memberList').innerHTML = list.map(m => {
         const isOwner = m.user_id === state.groupOwnerUserId;
@@ -1254,10 +1925,12 @@ function renderMembers() {
         const auth = state.memberAuth[m.user_id] === true;
         const displayName = b.nick || m.nick_name || '(无名)';
         let badges = '';
+        // ← 自动 Bot 标识：ID 以 "bot" 开头的成员即为机器人
+        const isBotByUid = (m.user_id || '').toLowerCase().startsWith('bot');
         // 系统默认铭牌（群主/元宝AI/机器人/成员）
         if (isOwner) badges += '<span class="member-badge admin">群主</span>';
+        else if (isBotByUid || m.member_type === 3) badges += '<span class="member-badge bot">🤖 机器人</span>';
         else if (m.member_type === 2) badges += '<span class="member-badge ai">元宝AI</span>';
-        else if (m.member_type === 3) badges += '<span class="member-badge bot">机器人</span>';
         else if (m.member_type === 1) badges += '<span class="member-badge">成员</span>';
         // 自定义铭牌 / 钻标（V4.6 恢复）
         if (b.type || b.text) {
@@ -1271,7 +1944,7 @@ function renderMembers() {
             ? `<img src="${avatarUrl}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`
             : escapeHtml(initial);
         return `<div class="member-item clickable" data-uid="${uid}" data-nick="${escapeHtml(displayName)}"
-                 title="左键单击复制ID / 双击使用 / 右键设置"
+                 title="左键单击复制ID / 双击私聊 / 右键设置"
                  onclick="memberClick(event,this)" ondblclick="memberDblClick(event,this)" oncontextmenu="memberContextMenu(event,this)">
             <div class="member-avatar-wrap">${avatarHtml}</div>
             <div class="member-info">
@@ -1296,42 +1969,133 @@ function memberDblClick(e, el) {
     if (e.button !== 0) return;
     clearTimeout(_memberClickTimer);
     const uid = el.dataset.uid;
-    if (uid) useMemberAsTarget(uid, el.dataset.nick || '');
+    // ← 修改：双击成员 → 弹出独立私聊窗口（不再是切到现有私聊模式）
+    if (uid) openDmModal(uid, el.dataset.nick || '');
 }
 function memberContextMenu(e, el) {
     e.preventDefault();
     const uid = el.dataset.uid;
     if (uid) openBadgeEditor(uid);
 }
-function useMemberAsTarget(uid, nick) {
-    switchTab('tab-messages');
-    // 智能切换：当前是 at/atspam 模式则保持 at，否则切到 dm（便于私聊）
-    if (currentMode !== 'at' && currentMode !== 'atspam' && currentMode !== 'multi-at') {
-        setMode('dm');
-    }
-    $('inputTargetId').value = uid;
-    $('inputTargetNick').value = nick || '';
-    // 发送面板悬浮于消息之上（吸底），滚动到最新消息即可看到
-    const ml = $('messageLog');
-    if (ml) ml.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    showToast(`已选择 ${nick || uid}${currentMode === 'dm' ? '（私聊）' : '（@）'}`, 'success');
+// ← 修改：独立私聊窗口（双击成员弹出，不改变当前发送模式）
+function openDmModal(uid, nick) {
+    if (!uid) return;
+    const nickEl = $('dmTargetNick');
+    if (nickEl) nickEl.textContent = nick || '(未知)';
+    const msg = $('dmMessage');
+    if (msg) { msg.value = ''; setTimeout(() => msg.focus(), 50); }
+    // 记录当前私聊目标
+    _dmTarget = { user_id: uid, nick: nick || '' };
+    const modal = $('dmModal');
+    if (modal) modal.classList.add('active');
+    // ← 修复：打开时重置签名（避免不同用户切换时误用上一人的缓存），再加载
+    const hbox = $('dmHistory');
+    if (hbox) { delete hbox.dataset.sig; delete hbox.dataset.loaded; }
+    loadDmHistory(uid);
+    // ← 修复：私聊窗口实时轮询（每 2 秒刷新历史），对方发来的新私聊自动出现
+    startDmPolling(uid);
+    // ← 修复：显示私聊高级选项（标题行常显，内容默认收起）
+    const dmAdv = $('dmAdvOptions');
+    if (dmAdv) dmAdv.style.display = '';
 }
-function copyText(text) {
-    navigator.clipboard.writeText(text).then(() => showToast('已复制', 'success')).catch(() => showToast('复制失败', 'error'));
+function closeDmModal() {
+    const modal = $('dmModal');
+    if (modal) modal.classList.remove('active');
+    _dmTarget = null;
+    stopDmPolling();
 }
 
-// ── 科技感大公司级模式（v6.0） ──
-function applyTechMode(enabled) {
-    document.documentElement.classList.toggle('tech-mode', enabled);
-    const cb = $('settingTechMode');
-    if (cb) cb.checked = enabled;
+// ← 修复：私聊窗口实时轮询，对方新消息自动刷新（不重新加载整个列表，只更新）
+let _dmPollTimer = null;
+let _dmPollUid = '';
+function startDmPolling(uid) {
+    stopDmPolling();
+    _dmPollUid = uid;
+    _dmPollTimer = setInterval(() => { loadDmHistory(_dmPollUid); }, 2000);
 }
-function toggleTechMode(enabled) {
-    state.techMode = enabled;
-    localStorage.setItem('techMode', enabled ? '1' : '0');
-    applyTechMode(enabled);
-    showToast(enabled ? '🚀 已进入科技感 HUD 模式' : '已恢复经典模式', 'success');
+function stopDmPolling() {
+    if (_dmPollTimer) { clearInterval(_dmPollTimer); _dmPollTimer = null; }
+    _dmPollUid = '';
 }
+
+// ← 补：加载私聊历史（/api/messages?c2c_user=uid，仿主页消息样式渲染）
+// ← 修复：签名比对——无变化不重渲染（避免每 2 秒轮询闪烁），仅首次/有变化时刷新
+async function loadDmHistory(uid) {
+    const box = $('dmHistory');
+    if (!box) return;
+    const r = await api(`/api/messages?limit=100&c2c_user=${encodeURIComponent(uid)}`);
+    if (!r || !r.messages) { if (!box.dataset.loaded) box.innerHTML = '<div class="empty-state">暂无历史消息</div>'; return; }
+    const msgs = r.messages;
+    const sig = msgs.map(m => (m.sender_id || '') + '|' + (m.content || '') + '|' + (m.time || '')).join('\n');
+    if (sig === box.dataset.sig) { if (box.scrollTop === 0 || box.scrollTop + box.clientHeight >= box.scrollHeight - 40) box.scrollTop = box.scrollHeight; return; }
+    box.dataset.sig = sig;
+    box.dataset.loaded = '1';
+    if (!msgs.length) { box.innerHTML = '<div class="empty-state">暂无与该用户的历史消息</div>'; return; }
+    box.innerHTML = msgs.map(m => {
+        const isMine = m.sender_id === state.botId;
+        const who = isMine ? '我' : (m.sender_name || '对方');
+        const t = m.time ? new Date(m.time).toLocaleString('zh-CN', { hour12: false }) : '';
+        return `<div class="dm-msg ${isMine ? 'mine' : 'theirs'}">`
+             + `<span class="dm-msg-meta">${escHtml(who)} ${t ? '· ' + escHtml(t) : ''}</span>`
+             + `<span class="dm-msg-bubble">${escHtml(m.content || '')}</span></div>`;
+    }).join('');
+    box.scrollTop = box.scrollHeight;  // 滚动到底部（最新消息）
+}
+async function sendDmMessage() {
+    const msg = $('dmMessage');
+    const text = msg ? msg.value.trim() : '';
+    if (!text) { showToast('请输入私聊内容', 'warning'); return; }
+    if (!_dmTarget) { showToast('私聊目标无效', 'error'); return; }
+    const body = {
+        text,
+        mode: 'dm',
+        target_id: _dmTarget.user_id,
+        target_nick: _dmTarget.nick,
+    };
+    // ← 补：私聊高级选项（刷屏次数 + 间隔），展开状态才生效
+    const dmAdvBody = $('dmAdvOptionsBody');
+    if (dmAdvBody && dmAdvBody.style.display !== 'none') {
+        const cnt = parseInt($('dmAdvCount').value) || 1;
+        if (cnt > 1) {
+            body.count = cnt;
+            body.interval = parseFloat($('dmAdvInterval').value) || 0.5;
+        }
+    }
+    const r = await api('/api/send', { method: 'POST', body });
+    if (r && r.ok) {
+        showToast(`已私聊 ${_dmTarget.nick || _dmTarget.user_id}`, 'success');
+        if (msg) msg.value = '';
+        loadRecentMessages();
+        // ← 补：发送成功后刷新私聊历史
+        loadDmHistory(_dmTarget.user_id);
+    } else {
+        showToast((r && r.message) || '发送失败', 'error');
+    }
+}
+let _dmTarget = null;
+function copyText(text) {
+    // ← 修复：非 HTTPS / localhost 环境下 navigator.clipboard 可能为 undefined，
+    //   旧浏览器也不支持 Clipboard API，需降级到 execCommand('copy')。
+    const fallback = () => {
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            showToast(ok ? '已复制' : '复制失败', ok ? 'success' : 'error');
+        } catch (e) { showToast('复制失败', 'error'); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => showToast('已复制', 'success')).catch(fallback);
+    } else {
+        fallback();
+    }
+}
+
 function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 }
@@ -1343,7 +2107,11 @@ async function sendReply() {
     if (isNaN(idx) || idx < 0) { showToast('请输入有效序号', 'warning'); return; }
     if (!text) { showToast('请输入回复内容', 'warning'); return; }
     const m = state.messages[idx];
-    const body = { index: idx, text };
+    // ← 修复：优先回传后端 /api/messages 附带的 list_index（完整列表绝对位置），
+    //   避免前端数组索引（只含尾部 limit 条）与后端完整列表索引不一致的问题
+    const body = { text };
+    if (m && typeof m.list_index === 'number') body.list_index = m.list_index;
+    else body.index = idx;
     // ← 修复：附带被引用消息的 msg_id，供后端构造引用
     if (m && m.msg_id) body.ref_msg_id = m.msg_id;
     const at = $('replyAtUser').value.trim();
@@ -1396,19 +2164,52 @@ async function sendModalReply() {
 }
 
 // ── 图片上传发送 ──
+// ← 修改：选中的图片先进入"待发送队列"并显示在消息内容框，点发送才真正发送
+// ← 修复：严格区分图片/文件。仅当 MIME 为 image/* 或扩展名为常见图片格式时才按图片上传，
+//   否则按文件处理（走 /api/send-file），避免"本来是文件的被当作图片上传"
+function isImageFile(file) {
+    if (file && file.type && file.type.startsWith('image/')) return true;
+    const m = (file && file.name || '').match(/\.([^.]+)$/);
+    if (!m) return false;
+    return ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].indexOf(m[1].toLowerCase()) >= 0;
+}
 function handleImageFileSelect(e) {
     const file = e.target.files[0];
     if (!file) return;
-    $('imageFileLabel').classList.add('has-file');
-    $('imageFileLabel').querySelector('.file-name').textContent = file.name;
-    $('imagePreview').style.display = 'block';
-    $('imagePreviewImg').src = URL.createObjectURL(file);
-    $('imageFileSize').textContent = (file.size / 1024).toFixed(1) + ' KB';
-    $('imageFileType').textContent = file.type;
+    // ← 修复：非图片文件改按文件入队（占位符显示 [文件:...]，发送走 /api/send-file）
+    if (!isImageFile(file)) {
+        queuePendingMedia({ type: 'file', file, name: file.name, size: file.size });
+        $('imageFile').value = '';
+        showToast('检测到非图片文件，已按文件方式待发送', 'info');
+        return;
+    }
+    // 快捷按钮场景：入队 + 输入框占位（不立即发送）
+    queuePendingMedia({ type: 'image', file, name: file.name, size: file.size });
+    $('imageFile').value = '';
+    return;
 }
 async function sendImage() {
     const file = $('imageFile').files[0];
     if (!file) { showToast('请先选择图片', 'warning'); return; }
+    // ← 修复：非图片文件改走 /api/send-file，不当作图片上传
+    if (!isImageFile(file)) {
+        showToast('检测到非图片文件，已按文件方式发送', 'info');
+        const fd0 = new FormData();
+        fd0.append('file', file);
+        const cg0 = (typeof state !== 'undefined' && state.currentGroup) || '';
+        if (cg0) fd0.append('group', cg0);
+        const at0 = $('imageAtUser').value.trim();
+        if (at0) fd0.append('at_user', at0);
+        const nick0 = $('imageAtNick').value.trim();
+        if (nick0) fd0.append('at_nickname', nick0);
+        try {
+            const r0 = await fetch('/api/send-file', { method: 'POST', body: fd0 });
+            const j0 = await r0.json();
+            if (j0.ok) showToast('文件已发送', 'success');
+            else showToast(j0.message || '发送失败', 'error');
+        } catch (e0) { showToast('发送异常: ' + e0.message, 'error'); }
+        return;
+    }
     const fd = new FormData();
     fd.append('file', file);
     const curGroup = (typeof state !== 'undefined' && state.currentGroup) || '';
@@ -1421,20 +2222,25 @@ async function sendImage() {
         // ← 修复：路径 /api/send-image
         const res = await fetch('/api/send-image', { method: 'POST', body: fd });
         const j = await res.json();
-        if (j.ok) showToast('图片已发送', 'success');
+        if (j.ok) {
+            showToast('图片已发送', 'success');
+            // ← 补：发送成功后隐藏媒体面板（若由快捷按钮打开）
+            const mc = $('mediaControls');
+            if (mc && mc.style.display !== 'none') mc.style.display = 'none';
+        }
         else showToast(j.message || '发送失败', 'error');
     } catch(e) { showToast('发送异常: ' + e.message, 'error'); }
 }
 
 // ── 文件上传发送 ──
+// ← 修改：选中的文件先进入"待发送队列"并显示在消息内容框，点发送才真正发送
 function handleFileSelect(e) {
     const file = e.target.files[0];
     if (!file) return;
-    $('documentFileLabel').classList.add('has-file');
-    $('documentFileLabel').querySelector('.file-name').textContent = file.name;
-    $('fileInfo').style.display = 'block';
-    $('fileSize').textContent = (file.size / 1024).toFixed(1) + ' KB';
-    $('fileType').textContent = file.type || '未知类型';
+    // 快捷按钮场景：入队 + 输入框占位（不立即发送）
+    queuePendingMedia({ type: 'file', file, name: file.name, size: file.size });
+    $('documentFile').value = '';
+    return;
 }
 async function sendFile() {
     const file = $('documentFile').files[0];
@@ -1451,7 +2257,42 @@ async function sendFile() {
         // ← 修复：路径 /api/send-file
         const res = await fetch('/api/send-file', { method: 'POST', body: fd });
         const j = await res.json();
-        if (j.ok) showToast('文件已发送', 'success');
+        if (j.ok) {
+            showToast('文件已发送', 'success');
+            // ← 补：发送成功后隐藏媒体面板（若由快捷按钮打开）
+            const mc = $('mediaControls');
+            if (mc && mc.style.display !== 'none') mc.style.display = 'none';
+        }
+        else showToast(j.message || '发送失败', 'error');
+    } catch(e) { showToast('发送异常: ' + e.message, 'error'); }
+}
+
+// ── 视频发送（复用 /api/send-file 上传，视频以文件消息形式发送） ──
+function handleVideoSelect(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    $('videoFileLabel').classList.add('has-file');
+    $('videoFileLabel').querySelector('.file-name').textContent = file.name;
+    $('videoInfo').style.display = 'block';
+    $('videoSize').textContent = (file.size / 1024).toFixed(1) + ' KB';
+    $('videoType').textContent = file.type || '视频';
+}
+async function sendVideo() {
+    const file = $('videoFile').files[0];
+    if (!file) { showToast('请先选择视频', 'warning'); return; }
+    if (file.size > 20 * 1024 * 1024) { showToast('视频超过 20MB 上限', 'error'); return; }
+    const fd = new FormData();
+    fd.append('file', file);
+    const curGroup = (typeof state !== 'undefined' && state.currentGroup) || '';
+    if (curGroup) fd.append('group', curGroup);
+    const at = $('videoAtUser').value.trim();
+    if (at) fd.append('at_user', at);
+    const nick = $('videoAtNick').value.trim();
+    if (nick) fd.append('at_nickname', nick);
+    try {
+        const res = await fetch('/api/send-file', { method: 'POST', body: fd });
+        const j = await res.json();
+        if (j.ok) showToast('视频已发送', 'success');
         else showToast(j.message || '发送失败', 'error');
     } catch(e) { showToast('发送异常: ' + e.message, 'error'); }
 }
@@ -1462,8 +2303,11 @@ let _batchCancelled = false;
 const _BATCH_MAX = 50;
 
 function handleBatchImageSelect(e) {
-    const files = Array.from(e.target.files || []);
-    if (!files.length) return;
+    const all = Array.from(e.target.files || []);
+    // ← 修复：只接收图片文件，非图片文件直接过滤（避免"文件被当作图片上传"）
+    const files = all.filter(isImageFile);
+    if (files.length !== all.length) showToast(`已过滤 ${all.length - files.length} 个非图片文件`, 'warning');
+    if (!files.length) { e.target.value = ''; return; }
     const room = _BATCH_MAX - _batchFiles.length;
     if (room <= 0) { showToast(`最多选择 ${_BATCH_MAX} 张`, 'warning'); }
     _batchFiles = _batchFiles.concat(files.slice(0, Math.max(0, room)));
@@ -1552,31 +2396,8 @@ function debounce(fn, wait) {
     let t;
     return function(...args) { clearTimeout(t); t = setTimeout(() => fn.apply(this, args), wait); };
 }
-const filterMessagesDebounced = debounce(filterMessages, 200);
 const filterStickersDebounced = debounce(filterStickers, 200);
 const filterMembersDebounced = debounce(filterMembers, 200);
-
-// ── @全体（V4.2 增强：诊断 + 详细错误） ──
-async function sendAtAll() {
-    const text = $('atAllText').value.trim();
-    if (!text) { showToast('请输入内容', 'warning'); return; }
-    if (!confirm('确认发送 @全体成员？（将触发强提醒）')) return;
-    // 先做协议诊断
-    try {
-        const diag = await api('/api/diag/at-all', { method: 'GET' });
-        if (!diag.connected) { showToast('WebSocket 未连接，请先在设置中连接', 'error'); return; }
-        if (!diag.group_code) { showToast('未设置默认群', 'error'); return; }
-    } catch (_) {}
-    const r = await api('/api/send/at-all', { method: 'POST', body: { text } });
-    if (r && r.ok) {
-        showToast(r.message || '@全体已发送', 'success');
-        $('atAllText').value = '';
-    } else {
-        const msg = (r && r.message) || '发送失败';
-        const code = (r && r.code) || 'UNKNOWN';
-        showToast(`${msg} [${code}]`, 'error', 6000);
-    }
-}
 
 // ── AI 生成图片 ──
 async function sendAiImage() {
@@ -1614,8 +2435,8 @@ async function sendAiImage() {
     // ── 设置面板 ──
 async function saveSettings() {
     // ← 修复：字段名全部对齐后端 api_update_settings 的读取 key
+    // 主群概念已移除：不再提交 default_group，默认目标群为监听列表第一项
     const body = {
-        default_group: $('settingDefaultGroup').value.trim(),
         port: parseInt($('settingPort').value) || 8000,
         heartbeat_interval: parseFloat($('settingHeartbeatInterval').value) || 1.0,
         forward_mode_enabled: $('settingForwardMode').checked,
@@ -1671,7 +2492,7 @@ async function loadSettings() {
     const r = await api('/api/settings');
     if (!r) return;
     const s = r; // 直接是 settings 对象
-    if (s.default_group) $('settingDefaultGroup').value = s.default_group;
+    // 主群概念已移除：设置面板不再有默认群号输入框
     if (s.port) $('settingPort').value = s.port;
     if (s.heartbeat_interval) $('settingHeartbeatInterval').value = s.heartbeat_interval;
     if (s.forward_mode_enabled !== undefined) {
@@ -1817,8 +2638,9 @@ async function loadGroups() {
         state.groups = r.groups;
         // 预填充群名缓存
         r.groups.forEach(g => { if (g.group_name) state.groupNameCache[g.group_code] = g.group_name; });
-        // 同步当前监听群
-        if (r.current_group) state.currentGroup = r.current_group;
+        // ← 主群概念已移除：仅在尚未选择群时用默认目标群（监听列表第一项）初始化，
+        //   已选择（用户点击过切换）时不覆盖
+        if (r.current_group && !state.currentGroup) state.currentGroup = r.current_group;
         populateBatchGroups();
         // 群名去重：同名群附加群号，避免"两个一样的群"无法区分
         const nameCount = {};
@@ -1829,28 +2651,56 @@ async function loadGroups() {
         };
         const gl = $('groupsList');
         if (gl) {
+            // 多群监听：每项显示监听开关（👁 正在监听 / 空心未监听），点击行切换查看的群
             gl.innerHTML = r.groups.map(g => {
                 const active = g.group_code === state.currentGroup;
+                const listening = g.listening === true;
                 const meta = g.last_message || (g.message_count ? `${g.message_count} 条消息` : '');
-                return `<div class="member-item group-item${active ? ' active' : ''}" data-group="${escapeHtml(g.group_code)}" onclick="switchGroupByCode('${escapeHtml(g.group_code)}')">
+                return `<div class="member-item group-item${active ? ' active' : ''}${listening ? ' listening' : ''}" data-group="${escapeHtml(g.group_code)}" onclick="switchGroupByCode('${escapeHtml(g.group_code)}')">
                     <div class="member-info">
                         <div class="member-name">${active ? '🎧 ' : ''}${escapeHtml(gname(g))}</div>
                         <div class="member-id">${escapeHtml(meta)}</div>
                     </div>
+                    <button class="listen-toggle${listening ? ' on' : ''}" title="${listening ? '正在监听（点击停止）' : '未监听（点击开始监听）'}" onclick="event.stopPropagation();toggleGroupListen('${escapeHtml(g.group_code)}')">${listening ? '👁' : '👁‍🗨'}</button>
                 </div>`;
             }).join('') || '<div class="empty-state">暂无</div>';
         }
     }
 }
+// 多群监听：单独开/关某个群的监听（主群概念已移除，任何群都可开关）
+async function toggleGroupListen(code) {
+    if (!code) return;
+    const g = (state.groups || []).find(x => x.group_code === code);
+    const nowListening = g ? g.listening === true : false;
+    const next = !nowListening;
+    const r = await api('/api/groups/listen', { method: 'POST', body: { group_code: code, listen: next } });
+    if (r && r.ok) {
+        showToast(next ? '已开始监听该群' : '已停止监听该群', 'success');
+        loadGroups();
+        loadRecentMessages();
+    } else {
+        showToast((r && r.message) || '操作失败', 'error');
+        loadGroups();
+    }
+}
 function switchGroupByCode(code) {
     if (!code) return;
     state.currentGroup = code;
+    // ← 修复：切换群时立即清空旧群成员并显示加载中，
+    //   避免新群成员未返回前候选框/成员面板显示上一个群的成员
+    state.members = [];
+    state.membersGroup = '';
+    const ml = $('memberList');
+    if (ml) ml.innerHTML = '<div class="empty-state">成员加载中...</div>';
+    const badge = $('memberCountBadge');
+    if (badge) badge.textContent = '';
     api('/api/groups/switch', { method: 'POST', body: { group_code: code } }).then(r => {
         if (r && r.ok) {
             showToast('已切换群', 'success');
+            // ← 切换派后刷新所有面板：群列表 / 消息 / 成员
             loadGroups();
-            // ← 修复：切换监听群后立即刷新消息面板，跟随显示新群消息
             loadRecentMessages();
+            loadMembers();
         } else {
             showToast((r && r.message) || '切换失败', 'error');
         }
@@ -1859,7 +2709,7 @@ function switchGroupByCode(code) {
 
 // ── 插件生态（v4.4）──
 // 插件只需注册"页面"与"卡片"元数据，这里用系统统一 settings-section 样式渲染，
-// 自动继承 CSS 变量 / 液态玻璃 / 深色浅色 / 厂商效果主题，插件无法自定义 CSS。
+// 自动继承 CSS 变量 / 深色浅色 / 厂商效果主题，插件无法自定义 CSS。
 let pluginCardData = [];  // 当前渲染的卡片数据（用于操作按钮取表单字段）
 
 async function loadPlugins() {
@@ -2099,249 +2949,16 @@ async function runPluginAction(cardIdx, actionIdx) {
     }
 }
 
-
-// ── 🌊 全场景液态玻璃 LiquidGlass（V4.5 新增）──
-// 物理引擎（弹簧-阻尼）+ 设备感应器（重力/陀螺仪）+ 鼠标视差；折射/光影/性能 独立开关
-const LG = (() => {
-  const state = {
-    enabled: false, physics: false, refraction: false, lighting: false, perf: false,
-    extreme: false,                // 🚀 性能极致模式（V6.0）：折射光彩 + 液态玻璃真流动
-    _mem: null,                    // 进入极致模式前记忆的子开关状态，便于退出时还原
-    tilt: { x: 0, y: 0 },          // 当前（弹簧平滑后）倾斜
-    vel: { x: 0, y: 0 },           // 速度
-    target: { x: 0, y: 0 },        // 目标（来自感应器/鼠标）
-    dispScale: 26,
-    lightX: 50, lightY: 16,
-    running: false, raf: 0, last: 0,
-    fps: 60, frames: 0, fpsT: 0,
-    sensorsGranted: false, autoDegrade: false,
-  };
-  const K = 0.06;   // 弹簧刚度
-  const D = 0.86;   // 阻尼
-  const MAXT = 1;   // 倾斜幅度上限
-  const root = document.documentElement;
-  const dispEl = () => document.getElementById('lgDispMap');
-
-  function applyVars() {
-    root.style.setProperty('--lg-hx', state.lightX.toFixed(1) + '%');
-    root.style.setProperty('--lg-hy', state.lightY.toFixed(1) + '%');
-    root.style.setProperty('--lg-disp', state.dispScale.toFixed(1));
-    const de = dispEl();
-    if (de) de.setAttribute('scale', state.dispScale.toFixed(1));
-  }
-
-  function step() {
-    // 弹簧-阻尼物理：target 由感应器/鼠标设定，tilt 平滑追随
-    state.vel.x += (state.target.x - state.tilt.x) * K;
-    state.vel.y += (state.target.y - state.tilt.y) * K;
-    state.vel.x *= D; state.vel.y *= D;
-    state.tilt.x = Math.max(-MAXT, Math.min(MAXT, state.tilt.x + state.vel.x));
-    state.tilt.y = Math.max(-MAXT, Math.min(MAXT, state.tilt.y + state.vel.y));
-    const tiltMag = Math.hypot(state.tilt.x, state.tilt.y);
-    let base = state.refraction ? (state.perf ? 35 : 75) : 0;   // 增强：折射位移强度明显提升
-    // 🚀 性能极致模式：拉满折射位移（仅在已授权物理引擎+感应器时配合 lg-refract-flow 流动滤镜生效）
-    if (state.extreme && state.refraction) base = state.perf ? 60 : 110;
-    state.dispScale = base * (0.6 + tiltMag * 0.9);
-    // 高光位置随倾斜移动（光源固定、玻璃倾斜 → 高光偏移）
-    state.lightX = 50 - state.tilt.x * 38;
-    state.lightY = 16 - state.tilt.y * 30;
-    applyVars();
-  }
-
-  function loop(t) {
-    if (!state.running) return;
-    if (!state.last) state.last = t;
-    let dt = t - state.last; state.last = t;
-    if (dt > 60) dt = 60;
-    // FPS 监控 → 自动降级，避免卡死
-    state.frames++; state.fpsT += dt;
-    if (state.fpsT >= 1000) {
-      state.fps = Math.round(state.frames * 1000 / state.fpsT);
-      state.frames = 0; state.fpsT = 0;
-      if (!state.perf && state.fps < 30 && !state.autoDegrade) {
-        state.autoDegrade = true;
-        root.classList.add('lg-perf');
-        const pe = $('lgPerf'); if (pe) pe.checked = true;
-        showToast('液态玻璃已自动切换性能模式（帧率偏低）', 'warning');
-      }
-    }
-    if (state.physics || state.lighting) step();
-    state.raf = requestAnimationFrame(loop);
-  }
-  function start() { if (state.running) return; state.running = true; state.last = 0; state.raf = requestAnimationFrame(loop); }
-  function stop() { state.running = false; if (state.raf) cancelAnimationFrame(state.raf); }
-
-  function onOrientation(e) {
-    if (!state.enabled || !state.physics) return;
-    const gamma = e.gamma || 0, beta = e.beta || 0;
-    state.target.x = Math.max(-1, Math.min(1, gamma / 35));
-    state.target.y = Math.max(-1, Math.min(1, (beta - 45) / 35));
-  }
-  function onMotion(e) {
-    if (!state.enabled || !state.physics) return;
-    const a = e.accelerationIncludingGravity || e.acceleration;
-    if (!a) return;
-    state.vel.x += (a.x || 0) * 0.0008;   // 晃动 → 瞬态冲量
-    state.vel.y += (a.y || 0) * 0.0008;
-  }
-  function onMouse(e) {
-    if (!state.enabled || !state.physics) return;
-    state.target.x = (e.clientX / window.innerWidth - 0.5) * 1.6;
-    state.target.y = (e.clientY / window.innerHeight - 0.5) * 1.6;
-  }
-  function onVisibility() {
-    if (document.hidden) stop();
-    else if (state.enabled && (state.physics || state.lighting)) start();
-  }
-  function bindSensors() {
-    window.addEventListener('deviceorientation', onOrientation, { passive: true });
-    window.addEventListener('devicemotion', onMotion, { passive: true });
-    window.addEventListener('mousemove', onMouse, { passive: true });
-    document.addEventListener('visibilitychange', onVisibility);
-  }
-  async function requestSensors() {
-    try {
-      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-        const res = await DeviceOrientationEvent.requestPermission();
-        state.sensorsGranted = (res === 'granted');
-        if (res === 'granted' && typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-          try { await DeviceMotionEvent.requestPermission(); } catch (_) {}
-        }
-      } else { state.sensorsGranted = true; } // 非 iOS：默认可用
-    } catch (err) { state.sensorsGranted = false; }
-    applyAuth(); updateExtremeStatus();
-    return state.sensorsGranted;
-  }
-  function setEnabled(on) {
-    state.enabled = on;
-    root.classList.toggle('lg-full', on);
-    if (on) {
-      root.classList.toggle('lg-refraction', state.refraction);
-      root.classList.toggle('lg-lighting', state.lighting);
-      root.classList.toggle('lg-physics', state.physics);
-      root.classList.toggle('lg-perf', state.perf);
-      if (state.physics || state.lighting) start(); else stop();
-      applyVars();
-    } else { stop(); root.classList.remove('lg-full', 'lg-refraction', 'lg-lighting', 'lg-physics', 'lg-perf'); }
-    applyAuth(); updateExtremeStatus();
-  }
-  function setOpt(key, on) {
-    state[key] = on;
-    if (key === 'refraction') root.classList.toggle('lg-refraction', on && state.enabled);
-    if (key === 'lighting') root.classList.toggle('lg-lighting', on && state.enabled);
-    if (key === 'physics') root.classList.toggle('lg-physics', on && state.enabled);
-    if (key === 'perf') { root.classList.toggle('lg-perf', on && state.enabled); state.autoDegrade = false; }
-    if (key === 'physics') {
-      if (on && state.enabled && (state.physics || state.lighting)) start();
-      else if (!state.physics && !state.lighting) stop();
-    }
-    applyAuth(); updateExtremeStatus();
-    applyVars();
-  }
-  function applySubClasses() {
-    root.classList.toggle('lg-refraction', state.refraction && state.enabled);
-    root.classList.toggle('lg-lighting', state.lighting && state.enabled);
-    root.classList.toggle('lg-physics', state.physics && state.enabled);
-    root.classList.toggle('lg-perf', state.perf && state.enabled);
-  }
-  function syncToggle(id, v) { const el = $(id); if (el) el.checked = v; }
-  // 🚀 极致渲染仅在「极端模式 + 全场景开启 + 物理引擎启用 + 设备感应器已授权」四者齐备时生效
-  function applyAuth() {
-    root.classList.toggle('lg-authorized',
-      !!(state.extreme && state.enabled && state.physics && state.sensorsGranted));
-  }
-  function updateExtremeStatus() {
-    const el = $('lgExtremeStatus'); if (!el) return;
-    if (!state.extreme) { el.style.display = 'none'; el.textContent = ''; return; }
-    el.style.display = 'block';
-    if (state.physics && state.sensorsGranted) {
-      el.style.color = 'var(--success, #16a34a)';
-      el.innerHTML = '✅ 极致渲染已激活：折射光彩 + 液态玻璃真流动 生效中';
-    } else {
-      el.style.color = 'var(--warning, #d97706)';
-      const miss = [];
-      if (!state.physics) miss.push('🧲 物理引擎');
-      if (!state.sensorsGranted) miss.push('📡 设备感应器');
-      el.innerHTML = '⏳ 待授权：请启用 ' + miss.join(' 与 ') + ' 后，折射光彩与液态玻璃真流动才会生效';
-    }
-  }
-  // 🚀 性能极致模式：一键拉满折射光彩 + 液态玻璃真流动 + 增强光影；退出时还原用户原有子开关
-  function setExtreme(on) {
-    state.extreme = on;
-    if (on) {
-      state._mem = { enabled: state.enabled, physics: state.physics, refraction: state.refraction, lighting: state.lighting };
-      if (!state.enabled) { setEnabled(true); syncToggle('lgEnabled', true); }
-      if (!state.physics) { state.physics = true; syncToggle('lgPhysics', true); }
-      if (!state.refraction) { state.refraction = true; syncToggle('lgRefraction', true); }
-      if (!state.lighting) { state.lighting = true; syncToggle('lgLighting', true); }
-      root.classList.add('lg-extreme');
-      applyAuth();
-      if (state.physics || state.lighting) start();
-    } else {
-      root.classList.remove('lg-extreme', 'lg-authorized');
-      if (state._mem) {
-        if (state._mem.enabled !== state.enabled) { setEnabled(state._mem.enabled); syncToggle('lgEnabled', state._mem.enabled); }
-        state.physics = state._mem.physics; syncToggle('lgPhysics', state.physics);
-        state.refraction = state._mem.refraction; syncToggle('lgRefraction', state.refraction);
-        state.lighting = state._mem.lighting; syncToggle('lgLighting', state.lighting);
-      }
-      applySubClasses();
-      if (!state.physics && !state.lighting) stop();
-    }
-    applyVars(); updateExtremeStatus();
-  }
-  function init() {
-    bindSensors();
-    state.enabled = localStorage.getItem('lgEnabled') !== '0';
-    state.physics = localStorage.getItem('lgPhysics') === '1';
-    state.refraction = localStorage.getItem('lgRefraction') !== '0';  // 折射默认开启（增强）
-    state.lighting = localStorage.getItem('lgLighting') === '1';
-    state.perf = localStorage.getItem('lgPerf') === '1';
-    state.extreme = localStorage.getItem('lgExtreme') === '1';
-    const s = (id, v) => { const el = $(id); if (el) el.checked = v; };
-    s('lgEnabled', state.enabled); s('lgPhysics', state.physics);
-    s('lgRefraction', state.refraction); s('lgLighting', state.lighting); s('lgPerf', state.perf);
-    s('lgExtreme', state.extreme);
-    if (state.enabled) setEnabled(true);
-    if (state.extreme) setExtreme(true);
-  }
-  return { init, setEnabled, setOpt, setExtreme, requestSensors, state };
-})();
-
-function onLgEnabled(v) { LG.setEnabled(v); localStorage.setItem('lgEnabled', v ? '1' : '0'); toggleGlass(v); }
-function onLgPhysics(v) { LG.setOpt('physics', v); localStorage.setItem('lgPhysics', v ? '1' : '0'); }
-function onLgRefraction(v) { LG.setOpt('refraction', v); localStorage.setItem('lgRefraction', v ? '1' : '0'); }
-function onLgLighting(v) { LG.setOpt('lighting', v); localStorage.setItem('lgLighting', v ? '1' : '0'); }
-function onLgPerf(v) { LG.setOpt('perf', v); localStorage.setItem('lgPerf', v ? '1' : '0'); if (v) onLgExtreme(false); }  // 互斥：开性能兼容关性能极致
-function onLgExtreme(v) { LG.setExtreme(v); localStorage.setItem('lgExtreme', v ? '1' : '0'); if (v) onLgPerf(false); }  // 互斥：开性能极致关性能兼容
-async function requestLgSensors() {
-  const ok = await LG.requestSensors();
-  const el = $('lgSensorStatus');
-  if (el) el.textContent = ok ? '✅ 感应器已授权' : '⚠️ 未授权（用鼠标视差）';
-}
-
 async function init() {
     await loadSettings();
     await loadStickers();
     // 插件生态（v4.4）：加载插件列表并渲染动态页面/卡片
     try { await loadPlugins(); } catch (e) { console.error('[插件] 初始化失败', e); }
-    // 恢复液态玻璃开关（V4.2 默认关闭）
-    toggleGlass(state.glassEnabled);
-    // 恢复毛玻璃开关（V4.2 默认关闭）
-    toggleFrost(state.frostEnabled);
-    // 恢复界面效果总开关（V4.2 默认关闭）
-    toggleEffectEnabled(state.effectEnabled);
     // 恢复背景设置（v4.0）
     applyBackground();
     // 恢复 QQ 主题（v5.0）
     applyQQTheme();
-    initHarmonySpatialInteractions();   // 🌌 鸿蒙空间光感：点击粒子交互
     renderThemeGrid();
-    // 恢复手机厂商效果（受总开关控制）
-    applyPhoneEffect();
-    renderEffectGrid();
-    // 恢复科技感 HUD 模式（v4.1Pro）
-    applyTechMode(state.techMode);
     // 初始化 LaTeX 编辑器（v4.1Pro）
     initLatexControls();
     // 同步黑夜模式开关
@@ -2350,15 +2967,13 @@ async function init() {
     await connect();
     loadGroups();
     loadMembers();
-    // V4.5：全场景液态玻璃（物理引擎 + 感应器）
-    try { LG.init(); } catch (e) { console.error('[liquid-glass] 初始化失败', e); }
 }
 init();
 'use strict';
 
 /* ── 共享工具：把单个设置项同步到后端 /api/settings（后端化个性化） ── */
 function _persistPref(key, value) {
-    try { localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value)); } catch (e) {}
+    try { safeSet(key, typeof value === 'string' ? value : JSON.stringify(value)); } catch (e) {}
     fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, value }) }).catch(() => {});
 }
@@ -2377,71 +2992,6 @@ function _loadServerPref(key, fallback) {
 }
 window._persistPref = _persistPref;
 window._loadServerPref = _loadServerPref;
-
-
-/* ═══════════════════════════════════════
-   🎬 视频背景（自定义 bg-mode：video）
-   ═══════════════════════════════════════ */
-const VideoBG = {
-    el: null,
-    ensure() {
-        if (this.el) return;
-        this.el = document.createElement('video');
-        this.el.id = 'videoBgEl';
-        this.el.autoplay = true; this.el.muted = true; this.el.loop = true; this.el.playsInline = true;
-        Object.assign(this.el.style, {
-            position: 'fixed', inset: '0', width: '100%', height: '100%',
-            objectFit: 'cover', zIndex: '-2', pointerEvents: 'none', display: 'none'
-        });
-        document.body.prepend(this.el);
-    },
-    apply(url) {
-        this.ensure();
-        if (!url) { this.clear(); return; }
-        this.el.src = url; this.el.style.display = 'block';
-        document.documentElement.classList.add('bg-mode-video');
-        this.el.play().catch(() => {});
-    },
-    clear() {
-        if (this.el) { this.el.pause(); this.el.removeAttribute('src'); this.el.style.display = 'none'; }
-        document.documentElement.classList.remove('bg-mode-video');
-    }
-};
-window.VideoBG = VideoBG;
-
-// 扩展原 setBackgroundMode 以支持 video 模式
-(function () {
-    const _orig = window.setBackgroundMode;
-    window.setBackgroundMode = function (mode) {
-        if (mode === 'video') {
-            state.backgroundMode = 'video';
-            localStorage.setItem('bgMode', 'video');
-            document.documentElement.classList.remove('bg-mode-colorful', 'bg-mode-glass', 'bg-mode-custom');
-            document.documentElement.classList.add('bg-mode-video');
-            showToast('请选择本地视频文件', 'info');
-            const input = document.createElement('input');
-            input.type = 'file'; input.accept = 'video/*';
-            input.onchange = (e) => {
-                const f = e.target.files?.[0]; if (!f) return;
-                const url = URL.createObjectURL(f);
-                VideoBG.apply(url);
-                state.customVideoBg = url;
-                localStorage.setItem('customVideoBg', url);
-                showToast('视频背景已应用', 'success');
-            };
-            input.click();
-        } else {
-            VideoBG.clear();
-            localStorage.removeItem('customVideoBg');
-            return _orig.apply(this, arguments);
-        }
-    };
-    // 启动时恢复视频背景
-    document.addEventListener('DOMContentLoaded', () => {
-        const saved = localStorage.getItem('customVideoBg');
-        if (saved && localStorage.getItem('bgMode') === 'video') VideoBG.apply(saved);
-    });
-})();
 
 /* ═══════════════════════════════════════
    🖼️ 图片编辑器（裁剪 / 旋转 / 涂鸦 / 颜色滤镜）
@@ -2573,19 +3123,23 @@ window.ImgEditor = ImgEditor;
 (function () {
     const _orig = window.handleCustomBgSelect;
     window.handleCustomBgSelect = function (e) {
-        const file = e.target.files?.[0]; if (!file) return;
+        const file = (e.target.files && e.target.files[0]); if (!file) return;
         if (!file.type.startsWith('image/')) return _orig.call(this, e);
         ImgEditor.open(file, (edited) => {
-            const dt = new DataTransfer(); dt.items.add(edited);
-            const fakeEv = { target: { files: dt.files } };
-            _orig.call(this, fakeEv);
-            showToast('已应用编辑后的图片', 'success');
+            // ← 兼容性：旧浏览器无 DataTransfer 构造器时退化为直接使用原文件
+            if (typeof DataTransfer === 'function') {
+                const dt = new DataTransfer(); dt.items.add(edited);
+                const fakeEv = { target: { files: dt.files } };
+                _orig.call(this, fakeEv);
+                showToast('已应用编辑后的图片', 'success');
+            } else {
+                _orig.call(this, { target: { files: [edited] } });
+                showToast('已应用编辑后的图片', 'success');
+            }
         });
         e.target.value = '';
     };
 })();
-
-
 
 /* ═══════════════════════════════════════
    🔌 后端化设置：开机时尝试从 /api/settings 拉取个性化
@@ -2594,24 +3148,16 @@ window._applyServerPref = function (key, value) {
     try {
         if (key === 'theme_qq') {
             if (typeof setQQTheme === 'function' && value && value !== state.theme_qq) setQQTheme(value);
-        } else if (key === 'effect') {
-            if (typeof setPhoneEffect === 'function' && value !== state.effect) setPhoneEffect(value);
         } else if (key === 'theme') {
             if (typeof setDarkMode === 'function' && ((value === 'dark') !== (state.theme === 'dark'))) setDarkMode(value === 'dark');
         } else if (key === 'backgroundMode') {
             if (typeof setBackgroundMode === 'function' && value !== state.backgroundMode) setBackgroundMode(value);
-        } else if (key === 'glassEnabled') {
-            if (typeof toggleGlass === 'function') toggleGlass(!!value);
-        } else if (key === 'effectEnabled') {
-            if (typeof toggleEffectEnabled === 'function') toggleEffectEnabled(!!value);
-        } else if (key === 'techMode') {
-            if (typeof applyTechMode === 'function') applyTechMode(!!value);
         } else if (key === 'customTheme') {
-            state.customTheme = value; localStorage.setItem('customTheme', JSON.stringify(value));
+            state.customTheme = value; safeSet('customTheme', JSON.stringify(value));
             if (typeof applyCustomGradientVars === 'function') applyCustomGradientVars();
         }
     } catch (e) { console.warn('[applyServerPref]', key, e); }
 };
 document.addEventListener('DOMContentLoaded', () => {
-    ['theme_qq','effect','theme','backgroundMode','glassEnabled','effectEnabled','techMode','customTheme'].forEach(k => _loadServerPref(k));
+    ['theme_qq','theme','backgroundMode','customTheme'].forEach(k => _loadServerPref(k));
 });

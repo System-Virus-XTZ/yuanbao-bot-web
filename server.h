@@ -14,9 +14,12 @@
 
 #include <string>
 #include <vector>
+#include <deque>
+#include <utility>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <filesystem>
 #ifndef YUANBAO_NO_OPENSSL
   #include <openssl/ssl.h>
 #endif
@@ -304,6 +307,161 @@ inline std::string random_hex_id() {
     return r;
 }
 
+// 解析图片宽高（PNG/JPEG/GIF/BMP），解析失败返回 false
+inline bool parse_image_dimensions(const std::string& data, int& w, int& h) {
+    w = h = 0;
+    if (data.size() < 16) return false;
+    // PNG: 8字节签名 + IHDR(宽高在 16-24 字节，大端)
+    if (data.size() >= 24 &&
+        (uint8_t)data[0] == 0x89 && (uint8_t)data[1] == 0x50 && (uint8_t)data[2] == 0x4E && (uint8_t)data[3] == 0x47) {
+        w = ((uint8_t)data[16] << 24) | ((uint8_t)data[17] << 16) | ((uint8_t)data[18] << 8) | (uint8_t)data[19];
+        h = ((uint8_t)data[20] << 24) | ((uint8_t)data[21] << 16) | ((uint8_t)data[22] << 8) | (uint8_t)data[23];
+        return w > 0 && h > 0;
+    }
+    // JPEG: FF D8 FF ... 扫描 SOFn 段（C0-CF 但排除 C4/C8/CC）
+    if ((uint8_t)data[0] == 0xFF && (uint8_t)data[1] == 0xD8) {
+        size_t i = 2;
+        while (i + 9 < data.size()) {
+            if ((uint8_t)data[i] != 0xFF) { i++; continue; }
+            unsigned char marker = (uint8_t)data[i + 1];
+            if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+                h = ((uint8_t)data[i + 5] << 8) | (uint8_t)data[i + 6];
+                w = ((uint8_t)data[i + 7] << 8) | (uint8_t)data[i + 8];
+                return w > 0 && h > 0;
+            }
+            i += 2;
+            size_t seg_len = ((uint8_t)data[i] << 8) | (uint8_t)data[i + 1];
+            i += seg_len;
+        }
+        return false;
+    }
+    // GIF: GIF87a/GIF89a，宽高在 6-10 字节（小端）
+    if (data.size() >= 10 &&
+        data.compare(0, 3, "GIF") == 0) {
+        w = (uint8_t)data[6] | ((uint8_t)data[7] << 8);
+        h = (uint8_t)data[8] | ((uint8_t)data[9] << 8);
+        return w > 0 && h > 0;
+    }
+    // BMP: "BM"，宽高在 18-26 字节（小端 int32）
+    if (data.size() >= 26 && data.compare(0, 2, "BM") == 0) {
+        w = (uint8_t)data[18] | ((uint8_t)data[19] << 8) | ((uint8_t)data[20] << 16) | ((uint8_t)data[21] << 24);
+        h = (uint8_t)data[22] | ((uint8_t)data[23] << 8) | ((uint8_t)data[24] << 16) | ((uint8_t)data[25] << 24);
+        if (h < 0) h = -h;
+        return w > 0 && h > 0;
+    }
+    return false;
+}
+
+// URL 解码：%XX → 字符，+ → 空格
+inline std::string url_decode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hexv = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int h = hexv(s[i + 1]), l = hexv(s[i + 2]);
+            if (h >= 0 && l >= 0) {
+                out += (char)((h << 4) | l);
+                i += 2;
+                continue;
+            }
+            out += s[i];
+        } else if (s[i] == '+') {
+            out += ' ';
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+// ← 补：URL 百分号编码（非 ASCII / 保留字符 → %XX），用于构造带中文参数/路径的 URL
+inline std::string url_encode(const std::string& s) {
+    static const char* hexdig = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hexdig[(c >> 4) & 0xF];
+            out += hexdig[c & 0xF];
+        }
+    }
+    return out;
+}
+
+// ← 补：UTF-8 与宽字符互转（Windows 下中文文件名必须用宽字符 API 读写）
+inline std::wstring utf8_to_wide(const std::string& s) {
+#ifdef YUANBAO_PLATFORM_WINDOWS
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+#else
+    std::wstring w;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp = 0; int take = 0;
+        if (c < 0x80) { cp = c; take = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; take = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; take = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; take = 4; }
+        else { w += (wchar_t)s[i]; i++; continue; }
+        if (i + take > s.size()) { i++; continue; }
+        for (int k = 1; k < take; k++) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+        if (cp > 0xFFFF) { cp -= 0x10000; w += (wchar_t)(0xD800 + (cp >> 10)); w += (wchar_t)(0xDC00 + (cp & 0x3FF)); }
+        else w += (wchar_t)cp;
+        i += take;
+    }
+    return w;
+#endif
+}
+
+inline std::string wide_to_utf8(const std::wstring& w) {
+#ifdef YUANBAO_PLATFORM_WINDOWS
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+#else
+    std::string s;
+    for (wchar_t ch : w) {
+        uint32_t cp = (uint32_t)ch;
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            cp = 0x10000 + ((uint32_t)(ch - 0xD800) << 10);
+        } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
+            cp += (uint32_t)(ch - 0xDC00);
+            // 写入合成后的码点
+        }
+        if (cp < 0x80) s += (char)cp;
+        else if (cp < 0x800) { s += (char)(0xC0 | (cp >> 6)); s += (char)(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { s += (char)(0xE0 | (cp >> 12)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
+        else { s += (char)(0xF0 | (cp >> 18)); s += (char)(0x80 | ((cp >> 12) & 0x3F)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
+    }
+    return s;
+#endif
+}
+
+// ← 补：按 UTF-8 路径读取二进制文件（Windows 走宽字符 API，支持中文文件名）
+inline bool read_file_utf8(const std::string& path_utf8, std::string& out) {
+    std::ifstream f(std::filesystem::path(utf8_to_wide(path_utf8)), std::ios::binary);
+    if (!f.good()) return false;
+    out.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return true;
+}
+
 inline uint64_t now_ms() {
     return yb_platform::now_ms();
 }
@@ -417,9 +575,11 @@ inline bool parse_multipart(const std::string& content_type, const std::string& 
 
 inline std::string mime_type(const std::string& path) {
     auto ext = path.substr(path.rfind('.') + 1);
+    // ← 修复：HTML/CSS/JS 显式携带 charset=utf-8，避免部分系统/老浏览器按
+    //   本地代码页（如 GBK）解析中文字符串导致乱码
     static const std::map<std::string, std::string> m = {
-        {"html","text/html"},{"htm","text/html"},{"css","text/css"},
-        {"js","application/javascript"},{"json","application/json"},
+        {"html","text/html; charset=utf-8"},{"htm","text/html; charset=utf-8"},{"css","text/css; charset=utf-8"},
+        {"js","application/javascript; charset=utf-8"},{"json","application/json; charset=utf-8"},
         {"png","image/png"},{"jpg","image/jpeg"},{"jpeg","image/jpeg"},
         {"gif","image/gif"},{"svg","image/svg+xml"},{"ico","image/x-icon"},
         {"woff","font/woff"},{"woff2","font/woff2"},{"ttf","font/ttf"},
@@ -746,6 +906,8 @@ inline Bytes encode_image_elem(const std::string& url, const std::string& uuid =
     bytes_append(img_info, encode_uint32(4, (uint32_t)h));
     bytes_append(img_info, encode_string(5, url));
     Bytes mc;
+    // ← 对齐 Python 实际发图路径 _build_image_elem（sender.py 1860-1875）：
+    //   msg_content: field 2=uuid, field 3=image_format, field 8=image_info_array
     if (!uuid.empty()) bytes_append(mc, encode_string(2, uuid));
     bytes_append(mc, encode_uint32(3, 255));
     bytes_append(mc, encode_message(8, img_info));
@@ -846,7 +1008,36 @@ inline Bytes encode_send_group_at_msg(const std::string& msg_id,
     uint32_t rnd = (uint32_t)(std::chrono::steady_clock::now().time_since_epoch().count() % 4294967295);
     bytes_append(body, encode_string(5, std::to_string(rnd)));
     bytes_append(body, encode_message(6, encode_at_custom_elem(user_id, display_name)));
-    bytes_append(body, encode_message(6, encode_text_elem(text)));
+    // ← 修复：text 为空（纯 @ 不跟内容）时不再追加空文本元素，与 Python 一致
+    if (!text.empty()) bytes_append(body, encode_message(6, encode_text_elem(text)));
+    return body;
+}
+
+/** 有序消息片段：type 0=文本, 1=@（保持 @ 在输入时的原始位置） */
+struct SendPart {
+    int type = 0;          // 0=text, 1=at
+    std::string text;      // type=0 时的文本
+    std::string user_id;   // type=1 时的被 @ 用户
+    std::string display;   // type=1 时的展示昵称
+};
+
+/** 按顺序编码 text/at 片段为群消息（@ 位置保持，多个 field 6） */
+inline Bytes encode_send_group_parts_msg(const std::string& msg_id,
+                                         const std::string& group_code,
+                                         const std::string& from_account,
+                                         const std::vector<SendPart>& parts) {
+    Bytes body;
+    bytes_append(body, encode_string(1, msg_id));
+    bytes_append(body, encode_string(2, group_code));
+    bytes_append(body, encode_string(3, from_account));
+    uint32_t rnd = (uint32_t)(std::chrono::steady_clock::now().time_since_epoch().count() % 4294967295);
+    bytes_append(body, encode_string(5, std::to_string(rnd)));
+    for (auto& p : parts) {
+        if (p.type == 1)
+            bytes_append(body, encode_message(6, encode_at_custom_elem(p.user_id, p.display)));
+        else if (!p.text.empty())
+            bytes_append(body, encode_message(6, encode_text_elem(p.text)));
+    }
     return body;
 }
 
@@ -864,7 +1055,8 @@ inline Bytes encode_send_group_multi_at_msg(const std::string& msg_id,
     bytes_append(body, encode_string(5, std::to_string(rnd)));
     for (auto& u : at_users)
         bytes_append(body, encode_message(6, encode_at_custom_elem(u.first, u.second)));
-    bytes_append(body, encode_message(6, encode_text_elem(text)));
+    // ← 修复：text 为空（纯 @ 不跟内容）时不再追加空文本元素，与 Python 一致
+    if (!text.empty()) bytes_append(body, encode_message(6, encode_text_elem(text)));
     return body;
 }
 
@@ -952,7 +1144,8 @@ inline Bytes encode_auth_bind(const std::string& bot_id, const std::string& toke
 // ═══════════════════════════════════════════════
 inline void sha1_raw(const uint8_t* input, size_t ilen, uint8_t output[20]) {
     uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
-    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+    // ← 修复：SHA1 用循环左移（ROTL），原实现误用右旋导致所有 SHA1 结果错误
+    auto rotl = [](uint32_t x, int n) { return (x << n) | (x >> (32 - n)); };
 
     size_t padded = ((ilen + 8) / 64 + 1) * 64;
     std::vector<uint8_t> dat(padded, 0);
@@ -968,7 +1161,7 @@ inline void sha1_raw(const uint8_t* input, size_t ilen, uint8_t output[20]) {
             w[i] = ((uint32_t)dat[chunk + i * 4] << 24) | ((uint32_t)dat[chunk + i * 4 + 1] << 16) |
                    ((uint32_t)dat[chunk + i * 4 + 2] << 8) | dat[chunk + i * 4 + 3];
         for (int i = 16; i < 80; i++)
-            w[i] = rotr(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+            w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
 
         uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
         for (int i = 0; i < 80; i++) {
@@ -977,8 +1170,8 @@ inline void sha1_raw(const uint8_t* input, size_t ilen, uint8_t output[20]) {
             else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
             else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
             else             { f = b ^ c ^ d; k = 0xCA62C1D6; }
-            uint32_t temp = rotr(a, 5) + f + e + k + w[i];
-            e = d; d = c; c = rotr(b, 30); b = a; a = temp;
+            uint32_t temp = rotl(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rotl(b, 30); b = a; a = temp;
         }
         h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
     }
@@ -1237,18 +1430,16 @@ public:
 } // namespace flood
 
 // ═══════════════════════════════════════════════
-//  玻璃着色器（独立头文件）
-// ═══════════════════════════════════════════════
-#include "glass.h"
-
-// ═══════════════════════════════════════════════
 //  贴纸库
 // ═══════════════════════════════════════════════
 class StickerLibrary {
 public:
     std::map<std::string, std::string> stickers;
+    std::map<std::string, std::string> icons;  // 贴纸名称 → ico 文件名（UTF-8，如 "01_六六六.ico"）
     StickerLibrary();
     std::string find_by_name(const std::string& name) const;
+    void scan_icons(const std::string& dir);   // 扫描 ico 目录，按名称（去"数字_"前缀）建立映射
+    std::string icon_file(const std::string& name) const;  // 返回对应 ico 文件名，无则空
 };
 
 // ═══════════════════════════════════════════════
@@ -1270,7 +1461,9 @@ struct LLMConfig {
 // ═══════════════════════════════════════════════
 struct BotConfig {
     std::string app_key, app_secret, api_domain, ws_url;
-    std::string default_group_code, yuanbao_id;
+    std::string yuanbao_id;
+    // 多群监听：所有被监听群，第一个为默认目标群（发送/转发/查询的默认目标）
+    std::vector<std::string> listen_groups;
     int heartbeat_interval = 10;
     int port = 5000;
     LLMConfig llm;
@@ -1278,6 +1471,38 @@ struct BotConfig {
     bool recall_monitor_enabled = false; // 撤回监控开关
 
     bool load(const std::string& path);
+
+    // 默认目标群：监听列表第一项（主群概念已移除，无监听群时返回空串）
+    const std::string& default_target() const {
+        static const std::string empty;
+        return listen_groups.empty() ? empty : listen_groups.front();
+    }
+
+    // 是否监听指定群
+    bool is_listening(const std::string& group) const {
+        if (group.empty()) return false;
+        for (auto& g : listen_groups) if (g == group) return true;
+        return false;
+    }
+};
+
+// ═══════════════════════════════════════════════
+//  JSON 配置插件（C++ 版插件系统：plugins/*.json）
+//  Python 版可用 importlib 动态加载代码，C++ 无等价机制，
+//  故采用"命令→回复"的声明式插件：收到群消息匹配命令前缀即回复。
+//  示例 plugins/example.json:
+//    { "name":"example","version":"1.0.0","author":"xx","description":"示例",
+//      "active":true,"commands":[{"command":"/ping","reply":"pong"}] }
+// ═══════════════════════════════════════════════
+struct PluginCommand {
+    std::string command;   // 命令前缀，如 "/ping"
+    std::string reply;     // 回复文本（支持 {user} 占位 = 发送者昵称）
+};
+struct PluginInfo {
+    std::string name, version, author, description;
+    bool active = true;
+    std::vector<PluginCommand> commands;
+    std::string error;     // 加载错误信息（前端展示）
 };
 
 // ═══════════════════════════════════════════════
@@ -1303,15 +1528,16 @@ public:
         flood_engine_.sender_ = std::move(cb);
     }
 
-    // 玻璃着色器
-    std::string glass_compile(const std::string& params_json);
-    std::string glass_preset(const std::string& name);
-    std::string glass_stats();
-
     // Bot 消息发送
     bool send_group_text(const std::string& group, const std::string& text);
     bool send_c2c_text(const std::string& to, const std::string& text);
     void record_sent_message(const std::string& group, const std::string& text);
+    // ← 扩展：记录自己发送的消息（可携带 media_info，如贴纸），供前端实时显示
+    void record_sent_message(const std::string& group, const std::string& text, const JsonVal& media_info);
+    // ← 补：记录自己发送的私聊消息（带 peer，供前端按人过滤历史）
+    void record_sent_c2c_message(const std::string& to, const std::string& text);
+    // Bot 在群里的显示昵称（从成员缓存获取，找不到回退"元宝"）
+    std::string bot_display_name();
     bool send_group_sticker(const std::string& group, const std::string& sticker_json,
                             const std::string& at_user = "", const std::string& at_nick = "",
                             const std::string& text = "");
@@ -1326,6 +1552,7 @@ public:
                        const std::string& user_id, const std::string& display_name = "");
     bool send_group_multi_at(const std::string& group, const std::string& text,
                              const std::vector<std::pair<std::string, std::string>>& at_users);
+    bool send_group_parts(const std::string& group, const std::vector<proto::SendPart>& parts);
     bool send_group_at_all(const std::string& group);
     bool send_group_reply(const std::string& group, const std::string& text, const std::string& ref_msg_id,
                           const std::string& at_user = "", const std::string& at_nick = "");
@@ -1339,19 +1566,34 @@ public:
     std::mutex msg_mu_;
     void cache_message(const JsonVal& msg);
 
-    // 群成员缓存（get_group_member_list 响应）
-    std::vector<std::pair<std::string, std::string>> members_cache_;  // {user_id, nick_name}
-    std::string members_owner_id_;
-    std::string members_group_name_;   // query_group_info 响应缓存的群名
+    // 群成员缓存（get_group_member_list 响应），按群号分别缓存
+    struct MemberCacheEntry {
+        std::vector<std::pair<std::string, std::string>> members; // {user_id, nick_name}
+        std::string owner_id;
+        std::string group_name;
+        int64_t fetched_at = 0;
+    };
+    std::map<std::string, MemberCacheEntry> members_cache_map_;   // group_code -> 缓存
+    std::string members_owner_id_;    // 当前查询群主（兼容旧引用）
+    std::string members_group_name_;  // 当前查询群名（兼容旧引用）
     std::mutex members_mu_;
+    std::mutex members_query_mu_;     // 串行化成员/群信息查询，避免并发覆盖响应标志
     std::condition_variable members_cv_;
     bool members_response_ = false;
     bool group_info_response_ = false;
+    int64_t members_fetched_at_ = 0;  // 最近成功获取时间（ms），用于复用缓存避免轮询风暴
+    std::string members_request_group_; // 最近一次成员查询的群号（get_group_member_list 响应写入缓存归属）
+    // ← 图片代理：保存最近一次上传的 COS 临时凭证，用于重新签名 GET 下载 URL
+    std::string cos_upload_region_, cos_upload_bucket_, cos_upload_location_;
+    std::string cos_upload_secret_id_, cos_upload_secret_key_, cos_upload_token_;
+    std::string cos_upload_key_time_;
+    int64_t cos_upload_expired_ = 0;
     // 多群聊监听：PUSH/日志中发现的 bot 所在群（group_code -> group_name，空名待查询）
     std::map<std::string, std::string> known_groups_;
     bool groups_scanned_ = false;       // 是否已从持久文件/历史日志恢复过群列表
     void persist_known_groups();        // 群列表落盘（logs/known_groups.json）
     void load_known_groups();           // 从持久文件恢复群列表
+    void auto_listen_from_known();      // 自动获取监听群：listen_groups 为空时全量同步所有已发现群
 
     // 在途 query_group_info 请求关联表（msg_id -> group_code）
     // 取代原先单槽位 pending_query_group_，并发查询响应按 msg_id 精确回写，杜绝群名张冠李戴
@@ -1372,6 +1614,7 @@ public:
     // 贴纸
     StickerLibrary stickers_;
     void process_llm_reply(const JsonVal& msg);
+    void handle_recall_notification(const JsonVal& push_json);  // 撤回事件通知（对齐 Python group_monitor.py）
     std::string call_llm_api(const std::string& user_message, const std::string& sender_name);
     void save_config();
 
@@ -1381,6 +1624,15 @@ public:
     bool forward_at_yuanbao_ = true;
     std::string wait_yuanbao_reply_ = "true";
     std::mutex forward_mu_;
+    // 代理转发：等待元宝回复回传的 FIFO 队列（原群, 原消息 msg_id）
+    std::deque<std::pair<std::string, std::string>> forward_queue_;
+
+    // 插件系统（JSON 配置插件）
+    std::vector<PluginInfo> plugins_;
+    std::mutex plugins_mu_;
+    void load_plugins();                       // 扫描 plugins/*.json
+    bool save_plugin(const PluginInfo& p);     // 写回 plugins/<name>.json
+    bool handle_plugin_command(const std::string& group, const std::string& content);  // 命令匹配→回复
 
     // 心跳
     int heartbeat_interval_ = 10;
@@ -1395,8 +1647,6 @@ private:
     MessageLogger msg_logger_{"./logs"};
 
     std::atomic<uint64_t> flood_total_sent_{0};
-    std::atomic<uint64_t> glass_compile_count_{0};
-    std::atomic<uint64_t> glass_frame_count_{0};
 
     // Bot WebSocket
     std::atomic<bool> bot_connected_{false};

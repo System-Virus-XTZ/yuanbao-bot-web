@@ -1,0 +1,12 @@
+{
+  "name": "example",
+  "version": "1.0.0",
+  "author": "yuanbao",
+  "description": "示例插件：/ping 回复 pong，/time 回复当前时间",
+  "active": false,
+  "commands": [
+    {"command": "/ping", "reply": "pong! 🏓"},
+    {"command": "/time", "reply": "现在是北京时间"},
+    {"command": "/help", "reply": "可用命令：/ping 测试连通性"}
+  ]
+}
